@@ -2167,7 +2167,11 @@ pub fn Stream(comptime H: type) type {
 
                 // DECRQM - Request Mode
                 'p' => switch (input.intermediates.len) {
-                    2 => decrqm: {
+                    // One intermediate is the ANSI form (CSI Ps $ p) and two
+                    // is the DEC private form (CSI ? Ps $ p). The arm below
+                    // already tells them apart, so admitting ONE here is what
+                    // makes the ANSI form reachable at all.
+                    1, 2 => decrqm: {
                         const ansi_mode = ansi: {
                             switch (input.intermediates.len) {
                                 1 => if (input.intermediates[0] == '$') break :ansi true,

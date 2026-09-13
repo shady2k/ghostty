@@ -4612,6 +4612,29 @@ test "request mode DECRQM with write_pty callback" {
         // Query DECECM, which Ghostty recognizes but does not allow changing
         s.nextSlice("\x1B[?117$p");
         try testing.expectEqualStrings("\x1B[?117;4$y", S.last_response.?);
+
+        // The ANSI form carries ONE intermediate ("$") instead of "?$", and
+        // it is the form a program uses for the modes that are not DEC
+        // private: `CSI Ps $ p`. Before the dispatch admitted a single
+        // intermediate, every one of these queries was answered with nothing.
+        //
+        // IRM (4) is reset by default, like every ANSI mode that is not in
+        // the `default` column of terminal/modes.zig.
+        s.nextSlice("\x1B[4$p");
+        try testing.expectEqualStrings("\x1B[4;2$y", S.last_response.?);
+
+        s.nextSlice("\x1B[4h");
+        s.nextSlice("\x1B[4$p");
+        try testing.expectEqualStrings("\x1B[4;1$y", S.last_response.?);
+
+        // SRM (12) IS set by default, so the same form reports the other
+        // state, and a mode the terminal does not implement still answers
+        // "not recognized" rather than staying silent.
+        s.nextSlice("\x1B[12$p");
+        try testing.expectEqualStrings("\x1B[12;1$y", S.last_response.?);
+
+        s.nextSlice("\x1B[9999$p");
+        try testing.expectEqualStrings("\x1B[9999;0$y", S.last_response.?);
     }
 }
 
