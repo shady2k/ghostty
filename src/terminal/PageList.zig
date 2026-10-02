@@ -21,6 +21,7 @@ const kitty = @import("kitty.zig");
 const terminal_mem = @import("mem.zig");
 const point = @import("point.zig");
 const pagepkg = @import("page.zig");
+const departurespkg = @import("departures.zig");
 const stylepkg = @import("style.zig");
 const size = @import("size.zig");
 const OffsetBuf = size.OffsetBuf;
@@ -434,6 +435,12 @@ page_serial_epoch: u64,
 /// logical scrollback accounting and does not change while a mapping is
 /// decommitted. It excludes encoded storage and unused preheated pool items.
 page_size: usize,
+
+/// The departure journal this list stages its crossings into, or null.
+/// Set on the primary screen's list only; the alternate screen's list and
+/// any list without an owner stage nothing. Explicit scroll operations and
+/// row-shrinking resize capture through this, before history can be pruned.
+departures: ?*departurespkg.Departures = null,
 
 /// Continuation state for incremental page compression. This allows
 /// compress(.incremental) to work. More details on all that there and
@@ -1246,6 +1253,21 @@ pub const Resize = struct {
 
 /// Resize
 /// TODO: docs
+/// Apply the row-count part of resize and stage any rows that leave the
+/// active area before `resize` enforces the history limits. Reflow-only row
+/// movement is deliberately outside this boundary.
+fn resizeWithoutReflowAndCapture(
+    self: *PageList,
+    opts: Resize,
+) Allocator.Error!void {
+    const before = departurespkg.Departures.historyRows(self);
+    try self.resizeWithoutReflow(opts);
+    const after = departurespkg.Departures.historyRows(self);
+    if (after > before) {
+        if (self.departures) |d| d.captureHistoryRows(self, before, after);
+    }
+}
+
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
 
@@ -1269,7 +1291,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     self.viewport_pin_row_offset = null;
 
     if (!opts.reflow) {
-        try self.resizeWithoutReflow(opts);
+        try self.resizeWithoutReflowAndCapture(opts);
         // Shrinking the active row count turns former active rows into
         // scrollback even without reflow, which can cross the line limit.
         self.limits.enforce(self, .lines);
@@ -1290,19 +1312,19 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // on the change of columns.
     const cols = opts.cols orelse self.cols;
     switch (std.math.order(cols, self.cols)) {
-        .eq => try self.resizeWithoutReflow(opts),
+        .eq => try self.resizeWithoutReflowAndCapture(opts),
 
         .gt => {
             // We grow rows after cols so that we can do our unwrapping/reflow
             // before we do a no-reflow grow.
             try self.resizeCols(cols, opts.cursor);
-            try self.resizeWithoutReflow(opts);
+            try self.resizeWithoutReflowAndCapture(opts);
         },
 
         .lt => {
             // We first change our row count so that we have the proper amount
             // we can use when shrinking our cols.
-            try self.resizeWithoutReflow(opts: {
+            try self.resizeWithoutReflowAndCapture(opts: {
                 var copy = opts;
                 copy.cols = self.cols;
                 break :opts copy;
@@ -3545,7 +3567,7 @@ pub fn scrollClear(self: *PageList) Allocator.Error!void {
     };
 
     // Scroll
-    for (0..non_empty) |_| _ = try self.grow();
+    for (0..non_empty) |_| _ = try self.growAndCaptureDeparture();
 }
 
 /// Give a live node a new generation before changing its coordinate layout in
@@ -3954,7 +3976,32 @@ pub fn setMaxLines(self: *PageList, max: ?usize) void {
 ///
 /// This returns the newly allocated page node if there is one.
 pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
+    return self.growInternal(false);
+}
+
+/// Grow the active area because a row crossed the primary boundary.
+/// Resize, reflow and page-list maintenance also call `grow`, but those do
+/// not represent departures and use `grow` above.
+pub fn growAndCaptureDeparture(self: *PageList) Allocator.Error!?*List.Node {
+    return self.growInternal(true);
+}
+
+fn growInternal(
+    self: *PageList,
+    capture_departure: bool,
+) Allocator.Error!?*List.Node {
     defer self.assertIntegrity();
+
+    // A successful growth moves the old top row into history. Only callers
+    // that performed a real scroll mark this as a departure; resize and
+    // reflow may grow the active area without crossing the primary boundary.
+    var crossed = false;
+    defer if (capture_departure and crossed) {
+        if (self.departures) |d| {
+            const depth = departurespkg.Departures.historyRows(self);
+            if (depth > 0) d.captureHistoryRows(self, depth - 1, depth);
+        }
+    };
 
     // Growing can move a complete page behind the active boundary.
     self.page_compression.markActivity();
@@ -3977,6 +4024,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // Growing inside the last page moves the active boundary without
         // allocating; that alone can make the first page wholly historical.
         self.limits.enforce(self, .lines);
+        crossed = true;
         return null;
     }
 
@@ -4082,6 +4130,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // Byte-limit recycling may leave history above the independent line
         // limit, so enforce it after the recycled page becomes the new tail.
         self.limits.enforce(self, .lines);
+        crossed = true;
         return first;
     }
 
@@ -4103,6 +4152,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // Appending a page can cross the line limit and can make the oldest
     // active-boundary page wholly historical.
     self.limits.enforce(self, .lines);
+    crossed = true;
     return next_node;
 }
 

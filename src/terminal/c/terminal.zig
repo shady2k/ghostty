@@ -10,6 +10,7 @@ const osc = @import("../osc.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
+const departures = @import("../departures.zig");
 const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
@@ -82,6 +83,11 @@ const TerminalWrapper = struct {
     /// a slice into this.
     terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
     stream: Stream,
+    /// The departure journal of this terminal's primary screen, staged at
+    /// the top of the primary active area on every crossing and drained
+    /// through the departure API. Installed into the primary screen at
+    /// wrap time; the alternate screen never departs anything.
+    departures: departures.Departures,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
     searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
@@ -684,12 +690,23 @@ fn wrap(
         .terminal = t,
         .io = io,
         .terminfo_name_buf = undefined,
+        .departures = departures.Departures.init(alloc),
         .stream = Stream.init(.{
             .allocator = alloc,
             .handler = handler,
             .continuation_max_bytes = continuation_max_bytes,
         }),
     };
+
+    // The journal is the primary screen's: it survives alternate-screen
+    // excursions because the primary screen does, and the alternate screen
+    // keeps a null pointer so its own scrolling stages nothing. The list
+    // carries it too, because the active boundary moves inside grow()
+    // whatever called it - the scroll paths, the insert paths, scrollClear.
+    const primary = t.screens.get(.primary).?;
+    primary.departures = &wrapper.departures;
+    primary.pages.departures = &wrapper.departures;
+
     return wrapper;
 }
 
@@ -1174,6 +1191,7 @@ pub const Option = enum(c_int) {
     terminfo_name = 37,
     clipboard_read = 38,
     clipboard_write_max_bytes = 39,
+    departure_max_bytes = 40,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1210,6 +1228,7 @@ pub const Option = enum(c_int) {
             .continuation_max_bytes,
             .unknown_max_bytes,
             .clipboard_write_max_bytes,
+            .departure_max_bytes,
             => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -1422,6 +1441,11 @@ fn setTyped(
             if (value) |ptr| ptr.* else 0,
         .clipboard_write_max_bytes => wrapper.stream.handler.kitty_clipboard_write_max_bytes =
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
+        .departure_max_bytes => wrapper.departures.setMaxBytes(
+            // A NULL pointer restores the default bound, matching how the
+            // other byte-limit options treat a cleared override.
+            if (value) |ptr| ptr.* else null,
+        ),
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -1499,6 +1523,186 @@ pub fn resize(
     return .success;
 }
 
+/// C: GhosttyTerminalDepartureStatus
+///
+/// The state of the departure journal between drains. `peak_bytes`,
+/// `refused_rows` and `refused_from` are handed over by each read: they
+/// report what happened since the previous status call, so a consumer
+/// that drains after every write sees each refusal exactly once.
+///
+/// This is not a sized struct: it carries no borrowed references and its
+/// layout is fixed by value fields alone.
+pub const DepartureStatus = extern struct {
+    /// The departure odometer: monotonic count of primary-screen
+    /// crossings, journaled or refused. Pruning, ED3, reset and reflow
+    /// never advance it.
+    odometer: u64,
+
+    /// Entries staged and not yet drained. This delimits what to drain;
+    /// it is never an interval boundary.
+    pending: usize,
+
+    /// Bytes currently staged, charged against the journal's bound.
+    staged_bytes: usize,
+
+    /// The high-water staged bytes since the previous status call, for
+    /// the byte-credit pool this journal's staging spends.
+    peak_bytes: usize,
+
+    /// Crossings the bound refused since the previous status call. A
+    /// refusal is pool exhaustion surfaced: the crossing happened, the
+    /// odometer counted it, and the row's contents were not retained.
+    refused_rows: u64,
+
+    /// The odometer value of the first of those refused crossings. The
+    /// refused span is `[refused_from, refused_from + refused_rows)`.
+    refused_from: u64,
+};
+
+/// C: GhosttyTerminalDepartureCell
+///
+/// One cell of a departed row, materialized at the instant of the
+/// crossing: the same reading a grid reference gives for a live row.
+/// The grapheme cluster bytes live in the drain call's UTF-8 buffer at
+/// `grapheme_off`/`grapheme_len`; a cell with no recorded cluster holds
+/// its cluster (if any) fully inside its own codepoint.
+pub const DepartureCell = extern struct {
+    has_text: bool,
+    wide: bool,
+    styled: bool,
+    /// The style of the cell at the crossing. Meaningful when `styled`
+    /// is set; the default style otherwise.
+    style: style_c.Style,
+    grapheme_off: u32,
+    grapheme_len: u16,
+};
+
+/// C: GhosttyTerminalDepartureRow
+///
+/// The head of a drained departure entry, filled before any buffer is
+/// written, so an out-of-space retry knows the row's width first.
+pub const DepartureRow = extern struct {
+    /// The odometer value this crossing produced.
+    odometer: u64,
+
+    /// Crossings the bound refused immediately before this row was
+    /// staged: their odometer values are
+    /// `[odometer - refused_before, odometer)`. Zero when nothing was
+    /// refused ahead of this row.
+    refused_before: u64,
+
+    /// The row's width at the moment it crossed. A row departs at the
+    /// geometry it had; a resize never rewrites a departed row.
+    cols: u16,
+
+    /// Whether the row was soft-wrapped at the crossing.
+    wrap: bool,
+
+    /// Whether the row continued a soft-wrapped row above it.
+    continuation: bool,
+};
+
+/// Read the departure journal's status. See `DepartureStatus` for the
+/// read-and-clear fields.
+///
+/// C: ghostty_terminal_vt_departure_status
+pub fn departure_status(
+    terminal_: Terminal,
+    out: ?*DepartureStatus,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const o = out orelse return .invalid_value;
+    const st = wrapper.departures.status();
+    o.* = .{
+        .odometer = st.odometer,
+        .pending = st.pending,
+        .staged_bytes = st.staged_bytes,
+        .peak_bytes = st.peak_bytes,
+        .refused_rows = st.refused_rows,
+        .refused_from = st.refused_from,
+    };
+    return .success;
+}
+
+/// Drain the oldest staged departure, if any.
+///
+/// On success the entry is popped and its bytes return to the staging
+/// bound; the row's cells are written to `out_cells` and its grapheme
+/// cluster bytes to `out_graphemes` (cell `i`'s cluster is
+/// `out_graphemes[off .. off + len]` from `out_cells[i]`).
+///
+/// `GHOSTTY_OUT_OF_SPACE` leaves the entry staged: `out_info` is filled
+/// first, `out_needed` (when given) receives the grapheme capacity the
+/// row needs, and the caller retries with `out_cells` holding at least
+/// `info.cols` entries and `out_graphemes` at least `*out_needed` bytes.
+/// Passing NULL for either buffer also returns `GHOSTTY_OUT_OF_SPACE`
+/// after filling `out_info`, which is how a caller sizes its buffers.
+///
+/// `GHOSTTY_NO_VALUE` means the journal is drained: this is the normal
+/// state after every write and every resize.
+///
+/// C: ghostty_terminal_vt_departure_drain_row
+pub fn departure_drain_row(
+    terminal_: Terminal,
+    out_info: ?*DepartureRow,
+    out_cells: ?[*]DepartureCell,
+    cells_cap: usize,
+    out_graphemes: ?[*]u8,
+    graphemes_cap: usize,
+    out_needed: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const info = out_info orelse return .invalid_value;
+    const e = wrapper.departures.peekOldest() orelse return .no_value;
+
+    info.* = .{
+        .odometer = e.odometer,
+        .refused_before = e.refused_before,
+        .cols = e.cols,
+        .wrap = e.wrap,
+        .continuation = e.wrap_continuation,
+    };
+
+    const cells = out_cells orelse {
+        if (out_needed) |n| n.* = e.utf8.len;
+        return .out_of_space;
+    };
+    if (cells_cap < e.cols) {
+        if (out_needed) |n| n.* = e.utf8.len;
+        return .out_of_space;
+    }
+    const graphemes = out_graphemes orelse {
+        if (out_needed) |n| n.* = e.utf8.len;
+        return .out_of_space;
+    };
+    if (graphemes_cap < e.utf8.len) {
+        if (out_needed) |n| n.* = e.utf8.len;
+        return .out_of_space;
+    }
+
+    for (e.cells, 0..) |cell, x| {
+        const dst = &cells[x];
+        dst.has_text = cell.hasText();
+        dst.wide = cell.wide == .wide;
+        dst.styled = cell.style_id != 0;
+        dst.style = style_c.Style.fromStyle(e.styleOf(cell));
+        dst.grapheme_off = 0;
+        dst.grapheme_len = 0;
+        if (e.clusterOf(x)) |cluster| {
+            // The whole UTF-8 buffer is copied below, so the entry's own
+            // offsets are the caller's offsets.
+            dst.grapheme_off = @intCast(cluster.ptr - e.utf8.ptr);
+            dst.grapheme_len = @intCast(cluster.len);
+        }
+    }
+    @memcpy(graphemes[0..e.utf8.len], e.utf8);
+
+    // Every buffer is written; the entry leaves the journal and its
+    // bytes return to the bound.
+    wrapper.departures.popOldest();
+    return .success;
+}
+
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     const t: *ZigTerminal = (terminal_ orelse return).terminal;
     t.fullReset();
@@ -1556,6 +1760,7 @@ pub const TerminalData = enum(c_int) {
     vt_ground = 38,
     cursor_at_prompt = 39,
     clipboard_write_max_bytes = 40,
+    departure_max_bytes = 41,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1581,6 +1786,7 @@ pub const TerminalData = enum(c_int) {
             .scrollback_max_lines,
             .continuation_max_bytes,
             .clipboard_write_max_bytes,
+            .departure_max_bytes,
             => usize,
             .width_px, .height_px => u32,
             .color_foreground,
@@ -1681,6 +1887,7 @@ fn getTyped(
         },
         .total_rows => out.* = t.screens.active.pages.total_rows,
         .scrollback_rows => out.* = t.screens.active.pages.total_rows - t.rows,
+        .departure_max_bytes => out.* = wrapper.departures.max_bytes,
         .width_px => out.* = t.width_px,
         .height_px => out.* = t.height_px,
         .color_foreground => out.* = (t.colors.foreground.get() orelse return .no_value).cval(),
@@ -1823,6 +2030,10 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     for (wrapper.searches.keys()) |search| search.terminal = null;
     wrapper.searches.deinit(alloc);
     wrapper.stream.deinit();
+    // Undrained entries are freed with the terminal that staged them: a
+    // caller that never drained loses nothing it was promised, because the
+    // journal dies with the handle that owned it.
+    wrapper.departures.deinit();
     t.deinit(alloc);
     if (wrapper.tmp_dir_path) |path| alloc.free(path);
     alloc.destroy(t);
@@ -6239,4 +6450,707 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
+}
+
+test "departure option and data" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var value: usize = 0;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .departure_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(departures.default_max_bytes, value);
+
+    const custom: usize = 4096;
+    try testing.expectEqual(
+        Result.success,
+        set(t, .departure_max_bytes, &custom),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(t, .departure_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(custom, value);
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .departure_max_bytes, null),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(t, .departure_max_bytes, @ptrCast(&value)),
+    );
+    try testing.expectEqual(departures.default_max_bytes, value);
+}
+
+test "departure status on a fresh terminal is empty and drained" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 0), st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(@as(u64, 0), st.refused_rows);
+
+    var info: DepartureRow = undefined;
+    var cells: [80]DepartureCell = undefined;
+    var graphemes: [256]u8 = undefined;
+    var needed: usize = 0;
+    try testing.expectEqual(
+        Result.no_value,
+        departure_drain_row(t, &info, &cells, cells.len, &graphemes, graphemes.len, &needed),
+    );
+}
+
+/// Drain every staged departure into text lines, oldest first.
+fn drainDepartureText(
+    t: Terminal,
+    alloc: std.mem.Allocator,
+) ![]const []const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+
+    var info: DepartureRow = undefined;
+    var cells: [256]DepartureCell = undefined;
+    var graphemes: [4096]u8 = undefined;
+    var needed: usize = 0;
+    while (true) {
+        const r = departure_drain_row(
+            t,
+            &info,
+            &cells,
+            cells.len,
+            &graphemes,
+            graphemes.len,
+            &needed,
+        );
+        if (r == .no_value) break;
+        if (r == .out_of_space) return error.OutOfSpace;
+        try testing.expectEqual(Result.success, r);
+
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(alloc);
+        for (cells[0..info.cols]) |cell| {
+            // Every textual cell carries its cluster's bytes in the
+            // grapheme buffer; a cell without text carries none.
+            if (!cell.has_text or cell.grapheme_len == 0) continue;
+            const off = cell.grapheme_off;
+            try text.appendSlice(
+                alloc,
+                graphemes[off .. off + cell.grapheme_len],
+            );
+        }
+        const trimmed = std.mem.trimEnd(u8, text.items, " ");
+        try lines.append(alloc, try alloc.dupe(u8, trimmed));
+        text.deinit(alloc);
+    }
+
+    return lines.toOwnedSlice(alloc);
+}
+
+test "alt-screen output emits nothing into the departure journal" {
+    // DONE WHEN (d): the alternate screen has no history of its own and
+    // departs nothing. Its scrolling - in-place, because the alternate
+    // screen is built without scrollback - never stages a row and never
+    // advances the odometer.
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    vt_write(t, "\x1b[?1049h", 8);
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try feed.appendSlice(testing.allocator, "alt-screen-line\r\n");
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 0), st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(@as(u64, 0), st.refused_rows);
+
+    // Leaving the alternate screen emits nothing either.
+    vt_write(t, "\x1b[?1049l", 8);
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 0), st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+}
+
+test "expanding an empty zero-retention screen does not advance departures" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    const zero: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &zero));
+    const feed = "visible-row\r\n";
+    vt_write(t, feed, feed.len);
+
+    try testing.expectEqual(Result.success, resize(t, 20, 8, 0, 0));
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 0), st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+}
+
+test "resizing around a non-bottom cursor does not journal retained history" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    const feed = "row-1\r\nrow-2\r\nrow-3\r\nrow-4\r\nrow-5\r\nrow-6\r\nrow-7\r\nrow-8\r\nrow-9\r\nrow-10\r\n";
+    vt_write(t, feed, feed.len);
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    const odometer = st.odometer;
+    try testing.expect(odometer > 0);
+    const prior_rows = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (prior_rows) |line| testing.allocator.free(line);
+        testing.allocator.free(prior_rows);
+    }
+
+    // Keep the cursor above the bottom so resize adds active rows instead of
+    // pulling retained history back onto the screen.
+    const home = "\x1b[1;1H";
+    vt_write(t, home, home.len);
+    try testing.expectEqual(Result.success, resize(t, 20, 8, 0, 0));
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(odometer, st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+}
+
+test "zero retention drains every crossing through the C API" {
+    // The primary has no history to read after a crossing; the C journal is
+    // the only representation of rows erased in place.
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    const zero: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &zero));
+    const feed = "zero-1\r\nzero-2\r\nzero-3\r\nzero-4\r\nzero-5\r\nzero-6\r\nzero-7\r\nzero-8\r\n";
+    vt_write(t, feed, feed.len);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 4), st.odometer);
+    try testing.expectEqual(@as(usize, 4), st.pending);
+    try testing.expectEqual(@as(u64, 0), st.refused_rows);
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |line| testing.allocator.free(line);
+        testing.allocator.free(lines);
+    }
+    try testing.expectEqual(@as(usize, 4), lines.len);
+    for (lines, 0..) |line, i| {
+        var expected: [16]u8 = undefined;
+        const want = try std.fmt.bufPrint(&expected, "zero-{d}", .{i + 1});
+        try testing.expectEqualStrings(want, line);
+    }
+
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(@as(u64, 0), st.refused_rows);
+}
+
+test "zero-retention journal captures cross-page region scrolls" {
+    // Large active areas can make the no-scrollback LF/IND path take its
+    // eraseRowBounded slow path. It must capture the same top row once.
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        300,
+    ));
+    defer free(t);
+
+    const zero: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &zero));
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "cross-{d:0>4}", .{i});
+        try feed.appendSlice(testing.allocator, line);
+        try feed.appendSlice(testing.allocator, "\r\n");
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 1), st.odometer);
+    try testing.expectEqual(@as(usize, 1), st.pending);
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |line| testing.allocator.free(line);
+        testing.allocator.free(lines);
+    }
+    try testing.expectEqual(@as(usize, 1), lines.len);
+    try testing.expectEqualStrings("cross-0000", lines[0]);
+}
+
+test "the configured departure bound reports refused crossings through the C API" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    const one_byte: usize = 1;
+    try testing.expectEqual(Result.success, set(t, .departure_max_bytes, &one_byte));
+    const feed = "bound-1\r\nbound-2\r\nbound-3\r\nbound-4\r\nbound-5\r\nbound-6\r\n";
+    vt_write(t, feed, feed.len);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expect(st.odometer > 0);
+    try testing.expect(st.refused_rows > 0);
+    try testing.expectEqual(st.refused_rows, st.odometer - st.refused_from);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(Result.no_value, departure_drain_row(t, undefined, null, 0, null, 0, null));
+
+    // Refusal status is handed over once; the odometer itself never resets.
+    const odometer = st.odometer;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(odometer, st.odometer);
+    try testing.expectEqual(@as(u64, 0), st.refused_rows);
+}
+
+test "hidden primary shrink stages before zero-retention erase" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        10,
+    ));
+    defer free(t);
+
+    const zero: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &zero));
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    var want: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (want.items) |line| testing.allocator.free(line);
+        want.deinit(testing.allocator);
+    }
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "primary-{d:0>2}", .{i});
+        try feed.appendSlice(testing.allocator, line);
+        try feed.appendSlice(testing.allocator, "\r\n");
+        try want.append(testing.allocator, try testing.allocator.dupe(u8, line));
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+    {
+        const lines = try drainDepartureText(t, testing.allocator);
+        defer {
+            for (lines) |line| testing.allocator.free(line);
+            testing.allocator.free(lines);
+        }
+    }
+
+    vt_write(t, "\x1b[?1049h", 8);
+    try testing.expectEqual(Result.success, resize(t, 20, 6, 0, 0));
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |line| testing.allocator.free(line);
+        testing.allocator.free(lines);
+    }
+    try testing.expectEqual(@as(usize, 4), lines.len);
+    for (lines, 11..) |line, row_index| {
+        try testing.expectEqualStrings(want.items[row_index], line);
+    }
+}
+
+test "a shrink while the alternate screen holds the pane emits once" {
+    // DONE WHEN (c): a shrink resizes the hidden primary screen too, and
+    // the rows it pushes out of the primary active area cross the top of
+    // the primary screen. They are staged at the resize, exactly once,
+    // and not again when the alternate screen returns - nor when more
+    // output scrolls the alternate screen in between.
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        10,
+    ));
+    defer free(t);
+
+    // Fill the primary screen with content that scrolls.
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    var want: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (want.items) |w| testing.allocator.free(w);
+        want.deinit(testing.allocator);
+    }
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "primary-{d:0>2}", .{i});
+        try feed.appendSlice(testing.allocator, line);
+        try feed.appendSlice(testing.allocator, "\r\n");
+        try want.append(testing.allocator, try testing.allocator.dupe(u8, line));
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    // Everything crossed before the alternate screen went up; drain it so
+    // the measurement below sees only what the shrink emits.
+    {
+        const lines = try drainDepartureText(t, testing.allocator);
+        defer {
+            for (lines) |l| testing.allocator.free(l);
+            testing.allocator.free(lines);
+        }
+        try testing.expect(lines.len > 0);
+    }
+
+    // The alternate screen takes the pane; a shrink pushes the primary's
+    // top rows out of its active area.
+    vt_write(t, "\x1b[?1049h", 8);
+    try testing.expectEqual(
+        Result.success,
+        resize(t, 20, 6, 0, 0),
+    );
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+
+    // The four rows the shrink pushed off, once, in order. A later return
+    // to primary must not replay any of these rows.
+    try testing.expectEqual(@as(usize, 4), lines.len);
+    for (lines, 11..) |line, row_index| {
+        try testing.expectEqualStrings(want.items[row_index], line);
+    }
+
+    // More output on the alternate screen emits nothing...
+    const alt_feed = "\x1b[?1049hmore-alt-output\r\nmore-alt-output\r\n";
+    vt_write(t, alt_feed, alt_feed.len);
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(usize, 0), st.pending);
+
+    // ...and returning to the primary does not emit them again.
+    vt_write(t, "\x1b[?1049l", 8);
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(usize, 0), st.pending);
+}
+
+test "a scroll then a full reset in one write keeps the departed rows" {
+    // A feed that scrolls rows and then resets the terminal leaves zero
+    // history and, before the journal, no way to read what scrolled. The
+    // journal staged those rows at the crossing, before the reset erased
+    // anything; the reset advances neither the odometer nor the journal.
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "reset-{d:0>2}", .{i});
+        try feed.appendSlice(testing.allocator, line);
+        try feed.appendSlice(testing.allocator, "\r\n");
+    }
+    try feed.appendSlice(testing.allocator, "\x1bc");
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+
+    try testing.expect(lines.len > 0);
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(@as(u64, lines.len), st.odometer);
+    // The first departed rows are the first printed ones: the journal is
+    // oldest-first, and the reset did not reorder or erase it.
+    try testing.expectEqualStrings("reset-00", lines[0]);
+}
+
+test "styled and clustered rows round-trip through the drain" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        40,
+        3,
+    ));
+    defer free(t);
+
+    const feed = "\x1b[1;31mred-bold\x1b[0m\r\n" ++
+        "fam \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}\r\n" ++
+        "plain\r\nl1\r\nl2\r\nl3\r\nl4\r\n";
+    vt_write(t, feed, feed.len);
+
+    var info: DepartureRow = undefined;
+    var cells: [40]DepartureCell = undefined;
+    var graphemes: [1024]u8 = undefined;
+    var needed: usize = 0;
+    const r = departure_drain_row(
+        t,
+        &info,
+        &cells,
+        cells.len,
+        &graphemes,
+        graphemes.len,
+        &needed,
+    );
+    try testing.expectEqual(Result.success, r);
+    {
+        const text = try rowText(
+            testing.allocator,
+            cells[0..info.cols],
+            graphemes[0..],
+        );
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("red-bold", text);
+    }
+
+    // The styled cell carries its style at the crossing.
+    try testing.expect(cells[0].has_text);
+    try testing.expect(cells[0].styled);
+    try testing.expect(cells[0].style.bold);
+
+    // A cluster wider than one codepoint arrives as its whole cluster.
+    var info2: DepartureRow = undefined;
+    const r2 = departure_drain_row(
+        t,
+        &info2,
+        &cells,
+        cells.len,
+        &graphemes,
+        graphemes.len,
+        &needed,
+    );
+    try testing.expectEqual(Result.success, r2);
+    const text2 = try rowText(
+        testing.allocator,
+        cells[0..info2.cols],
+        graphemes[0..],
+    );
+    defer testing.allocator.free(text2);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        text2,
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}",
+    ) != null);
+}
+
+test "departed rows preserve wrap and continuation flags" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        5,
+        2,
+    ));
+    defer free(t);
+
+    const feed = "ABCDEFGHIJKLMNOP";
+    vt_write(t, feed, feed.len);
+
+    var info: DepartureRow = undefined;
+    var cells: [5]DepartureCell = undefined;
+    var graphemes: [32]u8 = undefined;
+    var needed: usize = 0;
+    try testing.expectEqual(
+        Result.success,
+        departure_drain_row(t, &info, &cells, cells.len, &graphemes, graphemes.len, &needed),
+    );
+    const first_text = try rowText(
+        testing.allocator,
+        cells[0..info.cols],
+        graphemes[0..],
+    );
+    defer testing.allocator.free(first_text);
+    try testing.expectEqualStrings("ABCDE", first_text);
+    try testing.expect(info.wrap);
+    try testing.expect(!info.continuation);
+
+    try testing.expectEqual(
+        Result.success,
+        departure_drain_row(t, &info, &cells, cells.len, &graphemes, graphemes.len, &needed),
+    );
+    const second_text = try rowText(
+        testing.allocator,
+        cells[0..info.cols],
+        graphemes[0..],
+    );
+    defer testing.allocator.free(second_text);
+    try testing.expectEqualStrings("FGHIJ", second_text);
+    try testing.expect(info.wrap);
+    try testing.expect(info.continuation);
+}
+
+test "a drain that does not fit is retried, and the entry survives" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        3,
+    ));
+    defer free(t);
+
+    const feed = "hello-there-row\r\nl1\r\nl2\r\nl3\r\nl4\r\n";
+    vt_write(t, feed, feed.len);
+
+    var info: DepartureRow = undefined;
+    var needed: usize = 0;
+    // No cell buffer at all: the info is still filled, the entry stays.
+    const r = departure_drain_row(t, &info, null, 0, null, 0, &needed);
+    try testing.expectEqual(Result.out_of_space, r);
+    try testing.expect(info.cols > 0);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expect(st.pending > 0);
+
+    // A small grapheme buffer refuses the same way, telling the capacity.
+    var cells: [4]DepartureCell = undefined;
+    var tiny: [2]u8 = undefined;
+    const r2 = departure_drain_row(t, &info, &cells, 4, &tiny, tiny.len, &needed);
+    if (r2 == .out_of_space) {
+        try testing.expect(needed > tiny.len);
+    }
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expect(st.pending > 0);
+
+    // A full-capacity call drains the same oldest row.
+    var big_cells: [64]DepartureCell = undefined;
+    var big_graphemes: [2048]u8 = undefined;
+    const r3 = departure_drain_row(
+        t,
+        &info,
+        &big_cells,
+        big_cells.len,
+        &big_graphemes,
+        big_graphemes.len,
+        &needed,
+    );
+    try testing.expectEqual(Result.success, r3);
+    const text = try rowText(
+        testing.allocator,
+        big_cells[0..info.cols],
+        big_graphemes[0..],
+    );
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("hello-there-row", text);
+}
+
+/// Render one drained row from its cells and grapheme buffer.
+fn rowText(
+    alloc: std.mem.Allocator,
+    cells: []const DepartureCell,
+    graphemes: []const u8,
+) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    for (cells) |cell| {
+        if (!cell.has_text or cell.grapheme_len == 0) continue;
+        const off = cell.grapheme_off;
+        try text.appendSlice(alloc, graphemes[off .. off + cell.grapheme_len]);
+    }
+    const trimmed = std.mem.trimEnd(u8, text.items, " ");
+    defer text.deinit(alloc);
+    return alloc.dupe(u8, trimmed);
+}
+
+test "a scroll clear journals the rows it pushes into history" {
+    // scrollClear moves the active area into scrollback through PageList's
+    // own grow(), not through cursorDownScroll: the capture rides grow()
+    // itself, so these crossings are staged too (CSI 22 J).
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        5,
+    ));
+    defer free(t);
+
+    const feed = "sc-1\r\nsc-2\r\nsc-3\r\nsc-4\r\nsc-5\r\nsc-6\r\n";
+    vt_write(t, feed, feed.len);
+    vt_write(t, "\x1b[22J", "\x1b[22J".len);
+
+    const lines = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+    // The first row crossed during the feed; clearing the screen then pushes
+    // the five visible content rows into history. Every input row appears
+    // exactly once, oldest first.
+    const expected = [_][]const u8{ "sc-1", "sc-2", "sc-3", "sc-4", "sc-5", "sc-6" };
+    try testing.expectEqual(expected.len, lines.len);
+    for (lines, expected) |line, want| try testing.expectEqualStrings(want, line);
 }

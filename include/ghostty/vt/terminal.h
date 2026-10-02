@@ -1545,6 +1545,23 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: size_t*
    */
   GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES = 39,
+
+  /**
+   * Set the departure journal's staging bound in bytes.
+   *
+   * The journal stages every row that crosses the top of the primary
+   * active area, before any retention decision, for the embedder to
+   * drain. Its staging is bounded: a crossing the bound refuses is
+   * counted (the odometer advances) and surfaced through the departure
+   * status, never silently dropped. Lowering the bound never drops what
+   * is already staged. A NULL value pointer restores the default bound.
+   *
+   * The bound is the embedder's byte budget to set; see the Departure
+   * Journal section of departures.h for the full contract.
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_DEPARTURE_MAX_BYTES = 40,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1951,6 +1968,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: size_t *
    */
   GHOSTTY_TERMINAL_DATA_CLIPBOARD_WRITE_MAX_BYTES = 40,
+
+  /**
+   * The departure journal's configured staging bound in bytes.
+   *
+   * Output type: size_t *
+   */
+  GHOSTTY_TERMINAL_DATA_DEPARTURE_MAX_BYTES = 41,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
