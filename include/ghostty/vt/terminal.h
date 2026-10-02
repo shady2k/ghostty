@@ -328,6 +328,33 @@ typedef struct {
 } GhosttyTerminalScrollbar;
 
 /**
+ * Atomic snapshot of the primary screen's live-history position space.
+ *
+ * All fields are read together through GHOSTTY_TERMINAL_DATA_HISTORY_SNAPSHOT.
+ * The retained floor is an odometer ordinal; history positions must be paired
+ * with layout_generation because reflow and destructive retention can change
+ * their meaning without a primary-screen departure.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Retained primary-history rows in the current layout. */
+  uint64_t rows;
+
+  /** Total rows in the primary page list, including active rows. */
+  uint64_t total;
+
+  /** First retained departure ordinal; ordinals below it are no longer live. */
+  uint64_t retained_floor;
+
+  /** Changes when retained-history coordinates are reflowed or removed. */
+  uint64_t layout_generation;
+
+  /** Monotonic primary active-area crossing count. */
+  uint64_t odometer;
+} GhosttyTerminalHistorySnapshot;
+
+/**
  * Callback function type for bell.
  *
  * Called when the terminal receives a BEL character (0x07).
@@ -1977,6 +2004,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: size_t *
    */
   GHOSTTY_TERMINAL_DATA_DEPARTURE_MAX_BYTES = 41,
+
+  /**
+   * Atomic retained-history rows, total, floor, layout generation and
+   * departure odometer for the primary screen, even while the alternate
+   * screen is active.
+   *
+   * Output type: GhosttyTerminalHistorySnapshot *
+   */
+  GHOSTTY_TERMINAL_DATA_HISTORY_SNAPSHOT = 42,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

@@ -1717,6 +1717,24 @@ pub const TerminalScreen = ScreenSet.Key;
 /// C: GhosttyTerminalScrollbar
 pub const TerminalScrollbar = PageList.Scrollbar.C;
 
+/// C: GhosttyTerminalHistorySnapshot
+///
+/// One primary-history read. The row count, live total, departure odometer,
+/// retained floor and layout generation are captured together so callers do
+/// not combine values from different layouts.
+pub const HistorySnapshot = extern struct {
+    /// Retained primary-history rows in the current layout.
+    rows: u64,
+    /// Total rows represented by the primary page list, including active rows.
+    total: u64,
+    /// First retained departure ordinal. Ordinals below this floor are absent.
+    retained_floor: u64,
+    /// Changes when retained history coordinates are reflowed or removed.
+    layout_generation: u64,
+    /// Monotonic primary active-area crossing count.
+    odometer: u64,
+};
+
 /// C: GhosttyTerminalData
 pub const TerminalData = enum(c_int) {
     invalid = 0,
@@ -1761,6 +1779,7 @@ pub const TerminalData = enum(c_int) {
     cursor_at_prompt = 39,
     clipboard_write_max_bytes = 40,
     departure_max_bytes = 41,
+    history_snapshot = 42,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1788,6 +1807,7 @@ pub const TerminalData = enum(c_int) {
             .clipboard_write_max_bytes,
             .departure_max_bytes,
             => usize,
+            .history_snapshot => HistorySnapshot,
             .width_px, .height_px => u32,
             .color_foreground,
             .color_background,
@@ -1888,6 +1908,20 @@ fn getTyped(
         .total_rows => out.* = t.screens.active.pages.total_rows,
         .scrollback_rows => out.* = t.screens.active.pages.total_rows - t.rows,
         .departure_max_bytes => out.* = wrapper.departures.max_bytes,
+        .history_snapshot => {
+            const primary = t.screens.get(.primary).?;
+            const pages = &primary.pages;
+            wrapper.departures.updateRetainedFloor(pages);
+            const rows: u64 = @intCast(departures.Departures.historyRows(pages));
+            const odometer = wrapper.departures.odometer;
+            out.* = .{
+                .rows = rows,
+                .total = @intCast(pages.total_rows),
+                .retained_floor = wrapper.departures.retained_floor,
+                .layout_generation = pages.historyLayoutGeneration(),
+                .odometer = odometer,
+            };
+        },
         .width_px => out.* = t.width_px,
         .height_px => out.* = t.height_px,
         .color_foreground => out.* = (t.colors.foreground.get() orelse return .no_value).cval(),
@@ -3447,6 +3481,85 @@ test "get scrollback_rows" {
 
     try testing.expectEqual(Result.success, get(t, .scrollback_rows, @ptrCast(&scrollback)));
     try testing.expectEqual(@as(usize, 2), scrollback);
+}
+
+test "history snapshot tracks retained floor and layout generation" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        4,
+        2,
+    ));
+    defer free(t);
+
+    // Narrow geometry makes the same original text occupy more physical
+    // history rows. Widening reflows it and moves the retained floor forward.
+    const text = "abcdefghijklmnopqrstuvwx";
+    vt_write(t, text.ptr, text.len);
+
+    var before: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&before)));
+    try testing.expect(before.rows > 0);
+    try testing.expectEqual(before.odometer - before.rows, before.retained_floor);
+    const departures_before_reflow = before.odometer;
+
+    try testing.expectEqual(Result.success, resize(t, 8, 2, 0, 0));
+    var after_reflow: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&after_reflow)));
+    try testing.expectEqual(departures_before_reflow, after_reflow.odometer);
+    try testing.expect(after_reflow.retained_floor > before.retained_floor);
+    try testing.expect(after_reflow.layout_generation > before.layout_generation);
+
+    // Narrowing again creates more physical rows, but the retained ordinal
+    // floor never moves backwards. The generation still changes for the new
+    // coordinate layout.
+    try testing.expectEqual(Result.success, resize(t, 4, 2, 0, 0));
+    var after_narrow_reflow: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&after_narrow_reflow)));
+    try testing.expectEqual(after_reflow.odometer, after_narrow_reflow.odometer);
+    try testing.expectEqual(after_reflow.retained_floor, after_narrow_reflow.retained_floor);
+    try testing.expect(after_narrow_reflow.layout_generation > after_reflow.layout_generation);
+
+    // The primary history snapshot remains stable while the alternate screen
+    // is active; active-screen scrollback is a different coordinate space.
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt.ptr, enter_alt.len);
+    var alt_snapshot: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&alt_snapshot)));
+    try testing.expectEqual(after_narrow_reflow.rows, alt_snapshot.rows);
+    try testing.expectEqual(after_narrow_reflow.retained_floor, alt_snapshot.retained_floor);
+    try testing.expectEqual(after_narrow_reflow.layout_generation, alt_snapshot.layout_generation);
+    try testing.expectEqual(after_narrow_reflow.odometer, alt_snapshot.odometer);
+    const exit_alt = "\x1b[?1049l";
+    vt_write(t, exit_alt.ptr, exit_alt.len);
+
+    // ED3 removes retained history but is not a departure. The one snapshot
+    // exposes the cleared rows, floor and generation together.
+    const ed3 = "\x1b[3J";
+    vt_write(t, ed3.ptr, ed3.len);
+    var after_ed3: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&after_ed3)));
+    try testing.expectEqual(@as(u64, 0), after_ed3.rows);
+    try testing.expectEqual(after_narrow_reflow.odometer, after_ed3.odometer);
+    try testing.expectEqual(after_ed3.odometer, after_ed3.retained_floor);
+    try testing.expect(after_ed3.layout_generation > after_narrow_reflow.layout_generation);
+}
+
+test "history snapshot validates terminal and output" {
+    var t: Terminal = null;
+    var snapshot: HistorySnapshot = undefined;
+    try testing.expectEqual(Result.invalid_value, get(null, .history_snapshot, @ptrCast(&snapshot)));
+    try testing.expectEqual(Result.invalid_value, get(t, .history_snapshot, null));
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+    try testing.expectEqual(Result.success, get(t, .history_snapshot, @ptrCast(&snapshot)));
+    try testing.expectEqual(snapshot.odometer - snapshot.rows, snapshot.retained_floor);
 }
 
 test "get configured scrollback limits" {

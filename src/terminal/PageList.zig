@@ -419,6 +419,11 @@ pages: List,
 /// going to risk it.
 page_serial: u64,
 
+/// The layout generation used by live-history cursors. Unlike page serials,
+/// this generation describes the whole retained history coordinate space.
+/// It advances when reflow or destructive retention changes that space.
+history_layout_generation: u64 = 0,
+
 /// The first serial in the current whole-list validity epoch. Only `reset`
 /// advances this value, immediately before rebuilding every page. It is not
 /// the generation of the first page or the exact minimum live generation.
@@ -994,6 +999,9 @@ pub fn reset(self: *PageList) void {
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
 
+    // Reset discards all retained history and invalidates history cursors.
+    self.history_layout_generation += 1;
+
     // Begin a new whole-list validity epoch before rebuilding from the pools.
     // Every old reference now has a serial below the epoch and can be rejected
     // in O(1), even if the node pool later reuses its pointer address.
@@ -1043,6 +1051,7 @@ pub fn reset(self: *PageList) void {
 
     // Our total rows always goes back to the default
     self.total_rows = self.rows;
+    if (self.departures) |d| d.updateRetainedFloor(self);
 
     // Update all our tracked pins to point to our first page top-left
     // and mark them as garbage, because it got mangled in a way where
@@ -1265,11 +1274,17 @@ fn resizeWithoutReflowAndCapture(
     const after = departurespkg.Departures.historyRows(self);
     if (after > before) {
         if (self.departures) |d| d.captureHistoryRows(self, before, after);
+    } else if (after < before) {
+        // Growing the active area can consume the oldest live-history rows.
+        // That changes the coordinate space even though no page was pruned.
+        self.history_layout_generation += 1;
+        if (self.departures) |d| d.updateRetainedFloor(self);
     }
 }
 
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+    const original_cols = self.cols;
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -1331,6 +1346,13 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
             });
             try self.resizeCols(cols, opts.cursor);
         },
+    }
+
+    // Reflow changes the identity and positions of retained rows even when
+    // the live row count happens to stay the same.
+    if (opts.reflow and (opts.cols orelse original_cols) != original_cols) {
+        self.history_layout_generation += 1;
+        if (self.departures) |d| d.updateRetainedFloor(self);
     }
 
     // Various resize operations can change our total row count such
@@ -3613,6 +3635,11 @@ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     self.page_serial += 1;
 }
 
+/// Return the generation of the retained-history coordinate space.
+pub fn historyLayoutGeneration(self: *const PageList) u64 {
+    return self.history_layout_generation;
+}
+
 /// Compact a page to use the minimum required memory for the contents
 /// it stores. Returns the new node pointer if compaction occurred, or null
 /// if the page was already compact or compaction would not provide any
@@ -5639,6 +5666,13 @@ fn eraseRows(
         };
     }
 
+    // Removing history rows invalidates live-history positions even if the
+    // page itself remains in place. This also covers ED3 and bounded erases.
+    if (tl_pt == .history and erased > 0) {
+        self.history_layout_generation += 1;
+        if (self.departures) |d| d.updateRetainedFloor(self);
+    }
+
     // If we have a pinned viewport, we need to adjust for active area.
     self.fixupViewport(erased);
 }
@@ -7063,7 +7097,11 @@ const Limits = struct {
 
         // Reconcile viewport mode and cached row offsets with the combined prefix
         // removal only after every page and pin points into the final list.
-        if (removed > 0) pagelist.fixupViewport(removed);
+        if (removed > 0) {
+            pagelist.history_layout_generation += 1;
+            if (pagelist.departures) |d| d.updateRetainedFloor(pagelist);
+            pagelist.fixupViewport(removed);
+        }
     }
 
     /// Returns the minimum valid "max size" for a given number of rows and cols
