@@ -27,6 +27,7 @@
 //! counted, and the drain reports what is missing.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const PageList = @import("PageList.zig");
@@ -225,27 +226,42 @@ pub const Departures = struct {
     /// `[odometer - refused_pending, odometer)`.
     refused_pending: u64 = 0,
 
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Ring storage for staged entries. `entries.len` is allocated capacity;
+    /// live entries occupy `entry_len` slots starting at `entry_head`.
+    entries: []Entry = &.{},
+    entry_head: usize = 0,
+    entry_len: usize = 0,
+
+    /// Test-only counter proving growth work stays linear in the live entries.
+    entry_move_count: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
 
     pub fn init(alloc: Allocator) Departures {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *Departures) void {
-        for (self.entries.items) |e| self.freeEntry(e);
-        self.entries.deinit(self.alloc);
+        for (0..self.entry_len) |i| {
+            const index = (self.entry_head + i) % self.entries.len;
+            self.freeEntry(self.entries[index]);
+        }
+        if (self.entries.len > 0) self.alloc.free(self.entries);
         self.* = undefined;
     }
 
     /// Set the staging bound. `null` restores the default. The bound is a
-    /// pool the embedder owns; this only records it.
+    /// pool the embedder owns; this records it and trims an empty ring if needed.
     pub fn setMaxBytes(self: *Departures, max: ?usize) void {
         self.max_bytes = max orelse default_max_bytes;
+        if (self.entry_len == 0 and
+            self.entries.len * @sizeOf(Entry) > self.max_bytes)
+        {
+            self.resetEmptyRing();
+        }
     }
 
     /// Entries staged and not yet drained.
     pub fn pending(self: *const Departures) usize {
-        return self.entries.items.len;
+        return self.entry_len;
     }
 
     /// The number of history rows above the active area of `pages`. This is
@@ -275,57 +291,70 @@ pub const Departures = struct {
         return s;
     }
 
-    /// The oldest staged entry, without draining it. The entry stays valid
-    /// until `popOldest` runs; staging more entries does not invalidate it.
+    /// The oldest staged entry, without draining it. The pointer is valid
+    /// until `popOldest` or a ring growth relocates its storage.
     pub fn peekOldest(self: *Departures) ?*Entry {
-        if (self.entries.items.len == 0) return null;
-        return &self.entries.items[0];
+        if (self.entry_len == 0) return null;
+        return &self.entries[self.entry_head];
     }
 
-    /// Drain the oldest staged entry and compact the remaining prefix so
-    /// partial reads reuse Entry slots. When the queue empties, release its
-    /// backing storage and return those bytes to the staging budget.
+    /// Drain the oldest staged entry in constant time. Emptying releases any
+    /// high-water storage and keeps one reusable slot when the bound allows.
     pub fn popOldest(self: *Departures) void {
-        assert(self.entries.items.len > 0);
-        const e = self.entries.items[0];
+        assert(self.entry_len > 0);
+        const e = self.entries[self.entry_head];
         self.staged_bytes -= e.byteSize();
         self.freeEntry(e);
 
-        const remaining = self.entries.items.len - 1;
-        if (remaining == 0) {
-            const metadata_bytes = self.entries.capacity * @sizeOf(Entry);
-            self.entries.deinit(self.alloc);
-            self.entries = .empty;
-            self.staged_bytes -= metadata_bytes;
-            return;
-        }
-
-        std.mem.copyForwards(
-            Entry,
-            self.entries.items[0..remaining],
-            self.entries.items[1..],
-        );
-        self.entries.items[remaining] = undefined;
-        self.entries.items.len = remaining;
+        self.entry_head = (self.entry_head + 1) % self.entries.len;
+        self.entry_len -= 1;
+        if (self.entry_len == 0) self.resetEmptyRing();
     }
 
-    /// Ensure one Entry slot without exceeding the journal bound, including
-    /// both old and new backing arrays during a relocating growth.
-    fn reserveEntrySlot(self: *Departures) bool {
-        const needed = self.entries.items.len + 1;
-        if (self.entries.capacity >= needed) return true;
+    /// Reset an empty ring to one reusable Entry slot when the byte bound can
+    /// afford it. Large high-water buffers are released when the queue drains.
+    fn resetEmptyRing(self: *Departures) void {
+        assert(self.entry_len == 0);
+        if (self.entries.len == 1 and @sizeOf(Entry) <= self.max_bytes) {
+            self.entry_head = 0;
+            return;
+        }
+        if (self.entries.len > 0) {
+            self.staged_bytes -= self.entries.len * @sizeOf(Entry);
+            self.alloc.free(self.entries);
+            self.entries = &.{};
+            self.entry_head = 0;
+        }
+        if (@sizeOf(Entry) > self.max_bytes) return;
+        const slot = self.alloc.alloc(Entry, 1) catch return;
+        self.entries = slot;
+        self.staged_bytes += @sizeOf(Entry);
+        self.peak_bytes = @max(self.peak_bytes, self.staged_bytes);
+    }
 
+    /// Ensure one ring slot without exceeding the bound, including the old
+    /// and new buffers while a geometric growth is copied. If the peak does
+    /// not fit, refuse instead of falling back to one-slot quadratic growth.
+    fn reserveEntrySlot(self: *Departures) bool {
+        if (self.entry_len < self.entries.len) return true;
+
+        const old_capacity = self.entries.len;
+        const new_capacity = if (old_capacity == 0) @as(usize, 1) else old_capacity + @max(old_capacity / 2, 1);
         const current = self.staged_bytes;
-        const new_bytes = needed * @sizeOf(Entry);
+        const new_bytes = new_capacity * @sizeOf(Entry);
         if (current > self.max_bytes or new_bytes > self.max_bytes - current) return false;
 
-        const new_items = self.alloc.alloc(Entry, needed) catch return false;
-        @memcpy(new_items[0..self.entries.items.len], self.entries.items);
+        const new_entries = self.alloc.alloc(Entry, new_capacity) catch return false;
+        for (0..self.entry_len) |i| {
+            const old_index = (self.entry_head + i) % old_capacity;
+            new_entries[i] = self.entries[old_index];
+            if (comptime builtin.is_test) self.entry_move_count +|= 1;
+        }
 
-        const old_bytes = self.entries.capacity * @sizeOf(Entry);
-        if (self.entries.capacity > 0) self.alloc.free(self.entries.allocatedSlice());
-        self.entries.items = new_items[0..self.entries.items.len];
-        self.entries.capacity = needed;
+        const old_bytes = old_capacity * @sizeOf(Entry);
+        if (old_capacity > 0) self.alloc.free(self.entries);
+        self.entries = new_entries;
+        self.entry_head = 0;
         self.staged_bytes = current - old_bytes + new_bytes;
         self.peak_bytes = @max(self.peak_bytes, current + new_bytes);
         return true;
@@ -418,7 +447,9 @@ pub const Departures = struct {
         self.peak_bytes = @max(self.peak_bytes, self.staged_bytes + staging.peak);
 
         entry.allocation_bytes = staging.used;
-        self.entries.appendAssumeCapacity(entry);
+        const tail = (self.entry_head + self.entry_len) % self.entries.len;
+        self.entries[tail] = entry;
+        self.entry_len += 1;
         self.staged_bytes += entry.byteSize();
         self.refused_pending = 0;
         self.peak_bytes = @max(self.peak_bytes, self.staged_bytes);
@@ -590,7 +621,7 @@ test "staging is charged and the peak is handed over" {
     const charged = st.staged_bytes;
     while (d.peekOldest() != null) d.popOldest();
     const st2 = statusOnce(&d);
-    try testing.expectEqual(@as(usize, 0), st2.staged_bytes);
+    try testing.expectEqual(@sizeOf(Entry), st2.staged_bytes);
     try testing.expect(st2.peak_bytes >= charged);
 }
 
@@ -711,11 +742,131 @@ test "partial drains keep journal allocations within the staging bound" {
     try testing.expect(status.peak_bytes <= bound);
     try testing.expect(status.staged_bytes <= bound);
     d.popOldest();
-    try testing.expectEqual(@as(usize, 0), d.status().staged_bytes);
-    try testing.expectEqual(failing.freed_bytes, failing.allocated_bytes);
+    try testing.expectEqual(@sizeOf(Entry), d.status().staged_bytes);
+    try testing.expectEqual(@sizeOf(Entry), failing.allocated_bytes - failing.freed_bytes);
     d.deinit();
     try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     try testing.expect(current_allocated <= bound);
+}
+
+test "entry ring grows geometrically and drains in constant time" {
+    const testing = std.testing;
+    const Screen = @import("Screen.zig");
+    const count: usize = 20_000;
+    const discard_count = count / 2;
+
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 1,
+        .rows = 1,
+        .max_scrollback_bytes = null,
+    });
+    defer s.deinit();
+
+    var d = Departures.init(testing.allocator);
+    defer d.deinit();
+    const bound: usize = 32 * 1024 * 1024;
+    d.setMaxBytes(bound);
+
+    var old_capacity: usize = 0;
+    var moved_entries: usize = 0;
+    for (0..count) |_| {
+        const old_len = d.entry_len;
+        d.captureTopRow(&s.pages);
+        if (d.entries.len != old_capacity) {
+            try testing.expectEqual(
+                if (old_capacity == 0)
+                    @as(usize, 1)
+                else
+                    old_capacity + @max(old_capacity / 2, 1),
+                d.entries.len,
+            );
+            moved_entries += old_len;
+            old_capacity = d.entries.len;
+        }
+    }
+
+    try testing.expectEqual(count, d.pending());
+    try testing.expectEqual(@as(u64, count), d.odometer);
+    try testing.expect(moved_entries < count * 4);
+    try testing.expectEqual(@as(u64, @intCast(moved_entries)), d.entry_move_count);
+    const initial_capacity = d.entries.len;
+
+    // Advance the ring head, wrap the tail through the old buffer, then force
+    // one geometric growth. That growth must copy only the live ring entries.
+    for (0..discard_count) |_| d.popOldest();
+    try testing.expectEqual(discard_count, d.entry_head);
+    const to_fill = initial_capacity - d.pending();
+    for (0..to_fill) |_| d.captureTopRow(&s.pages);
+    try testing.expectEqual(initial_capacity, d.pending());
+    try testing.expectEqual(initial_capacity, d.entries.len);
+
+    const old_len = d.entry_len;
+    d.captureTopRow(&s.pages);
+    moved_entries += old_len;
+    const grown_capacity = d.entries.len;
+    try testing.expectEqual(initial_capacity + @max(initial_capacity / 2, 1), grown_capacity);
+    try testing.expectEqual(@as(usize, 0), d.entry_head);
+    try testing.expectEqual(initial_capacity + 1, d.pending());
+
+    const status = d.status();
+    try testing.expectEqual(@as(u64, 0), status.refused_rows);
+    try testing.expect(status.peak_bytes <= bound);
+    const total_appended = count + to_fill + 1;
+    try testing.expect(moved_entries < total_appended * 4);
+    try testing.expectEqual(@as(u64, @intCast(moved_entries)), d.entry_move_count);
+
+    for (0..d.pending()) |i| {
+        const oldest = d.peekOldest().?;
+        try testing.expectEqual(
+            @as(u64, @intCast(discard_count + i + 1)),
+            oldest.odometer,
+        );
+        const old_head = d.entry_head;
+        d.popOldest();
+        if (d.pending() > 0) {
+            try testing.expectEqual((old_head + 1) % grown_capacity, d.entry_head);
+            try testing.expectEqual(grown_capacity, d.entries.len);
+        }
+    }
+    try testing.expectEqual(@sizeOf(Entry), d.status().staged_bytes);
+}
+
+test "a 64 KiB representative feed stages departures within the default bound" {
+    const testing = std.testing;
+    const Screen = @import("Screen.zig");
+    const feed_size: usize = 64 * 1024;
+    const line = "feed-row 0123456789 abcdefghijklmnopqrstuv\r\n";
+
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+    });
+    defer s.deinit();
+
+    var d = Departures.init(testing.allocator);
+    defer d.deinit();
+    s.departures = &d;
+    s.pages.departures = &d;
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    while (feed.items.len + line.len <= feed_size) {
+        try feed.appendSlice(testing.allocator, line);
+    }
+    const full_lines = feed.items.len / line.len;
+    try feed.appendNTimes(testing.allocator, 'x', feed_size - feed.items.len);
+    try testing.expectEqual(feed_size, feed.items.len);
+
+    try s.testWriteString(feed.items);
+    const expected: u64 = @intCast(full_lines - s.pages.rows + 1);
+    try testing.expectEqual(expected, d.odometer);
+    try testing.expectEqual(@as(usize, @intCast(expected)), d.pending());
+
+    const status = d.status();
+    try testing.expectEqual(@as(u64, 0), status.refused_rows);
+    try testing.expect(status.staged_bytes <= default_max_bytes);
+    try testing.expect(status.peak_bytes <= default_max_bytes);
 }
 
 test "minimum byte limit recycles only history before departure capture" {

@@ -65,11 +65,12 @@ typedef struct {
   size_t pending;
 
   /** Bytes currently charged against the journal's bound: row buffers plus
-      the full Entry-list capacity, including unused slots. */
+      the full Entry-ring capacity, including unused slots. A drained journal
+      may retain one reusable slot. */
   size_t staged_bytes;
 
   /** High-water charged bytes since the previous status call, including
-      temporary capture and Entry-list growth copies. */
+      temporary capture and Entry-ring growth copies. */
   size_t peak_bytes;
 
   /** Crossings the bound refused since the previous status call. A
