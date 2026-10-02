@@ -222,6 +222,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyTerminalDepartureRow", terminal.DepartureRow),
     .initStruct("GhosttyTerminalDepartureStatus", terminal.DepartureStatus),
     .initStruct("GhosttyTerminalDesktopNotification", terminal.DesktopNotification),
+    .initStruct("GhosttyTerminalHistorySnapshot", terminal.HistorySnapshot),
     .initStruct("GhosttyTerminalModeConfig", terminal.ModeConfig),
     .initStruct("GhosttyTerminalProgressReport", terminal.ProgressReport),
     .initStruct("GhosttyTerminalScrollbar", terminal.TerminalScrollbar),

@@ -15,9 +15,10 @@
 //! reflow never advance it, so a prune inside the same feed that produced a
 //! row can never masquerade as a departure: the feed's own rows are already
 //! staged and the odometer already counted them. The retained floor — the
-//! odometer value below which nothing is retained in live history — is
-//! `odometer - historyRows`, and rises with every row retention removes while
-//! the odometer stands still.
+//! odometer value below which nothing is retained in live history — is stored
+//! separately from physical row counts. It moves forward when a completed
+//! history layout leaves a shorter retained suffix; reflow can change physical
+//! row counts, so consumers must not derive this value from `odometer - rows`.
 //!
 //! Staging is bounded. The bound is the byte budget the embedder sets (the
 //! default is `default_max_bytes`); a crossing the bound refuses advances the
@@ -210,6 +211,11 @@ pub const Departures = struct {
     /// Monotonic count of crossings, journaled or refused.
     odometer: u64 = 0,
 
+    /// Monotonic ordinal floor for rows no longer present in live history.
+    /// Reflow can change physical row count without changing the odometer, so
+    /// consumers use this retained cursor rather than deriving it each read.
+    retained_floor: u64 = 0,
+
     /// The staging bound in bytes. It charges row buffers, Entry-list
     /// capacity, and temporary capture/list-growth copies. Lowering it never
     /// drops what is already staged; it refuses crossings until drains free
@@ -272,6 +278,14 @@ pub const Departures = struct {
         // fewer rows than its active area, and that is zero history, not
         // a negative one.
         return pages.total_rows -| pages.rows;
+    }
+
+    /// Reconcile the retained ordinal floor with a completed history layout.
+    /// Move it forward when fewer rows remain; never reinterpret old rows as
+    /// new departures or move the floor backwards after a narrow reflow.
+    pub fn updateRetainedFloor(self: *Departures, pages: *const PageList) void {
+        const candidate = self.odometer -| @as(u64, @intCast(historyRows(pages)));
+        self.retained_floor = @max(self.retained_floor, candidate);
     }
 
     /// Read the journal's state, handing over (and clearing) the peak and
