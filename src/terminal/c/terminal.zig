@@ -6859,6 +6859,9 @@ test "a shrink while the alternate screen holds the pane emits once" {
         }
         try testing.expect(lines.len > 0);
     }
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    const odometer_before_shrink = st.odometer;
 
     // The alternate screen takes the pane; a shrink pushes the primary's
     // top rows out of its active area.
@@ -6881,17 +6884,83 @@ test "a shrink while the alternate screen holds the pane emits once" {
         try testing.expectEqualStrings(want.items[row_index], line);
     }
 
-    // More output on the alternate screen emits nothing...
-    const alt_feed = "\x1b[?1049hmore-alt-output\r\nmore-alt-output\r\n";
-    vt_write(t, alt_feed, alt_feed.len);
-    var st: DepartureStatus = undefined;
     try testing.expectEqual(Result.success, departure_status(t, &st));
+    const odometer_after_shrink = st.odometer;
+    try testing.expectEqual(odometer_before_shrink + 4, odometer_after_shrink);
     try testing.expectEqual(@as(usize, 0), st.pending);
 
-    // ...and returning to the primary does not emit them again.
+    // More output on the alternate screen emits nothing and does not move
+    // the primary odometer.
+    const alt_feed = "\x1b[?1049hmore-alt-output\r\nmore-alt-output\r\n";
+    vt_write(t, alt_feed, alt_feed.len);
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(odometer_after_shrink, st.odometer);
+    try testing.expectEqual(@as(usize, 0), st.pending);
+
+    // Returning to primary does not replay rows or advance its odometer.
     vt_write(t, "\x1b[?1049l", 8);
     try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(odometer_after_shrink, st.odometer);
     try testing.expectEqual(@as(usize, 0), st.pending);
+}
+
+test "wide bounded output reports every trailing refusal through the C API" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20_000,
+        3,
+    ));
+    defer free(t);
+
+    const tiny: usize = 1;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &tiny));
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..100) |_| try feed.appendSlice(testing.allocator, "x\r\n");
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    var st: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &st));
+    try testing.expectEqual(@as(u64, 98), st.odometer);
+    try testing.expect(st.pending > 0);
+    try testing.expect(st.refused_rows > 0);
+
+    const cols: usize = 20_000;
+    const cells = try testing.allocator.alloc(DepartureCell, cols);
+    defer testing.allocator.free(cells);
+    const graphemes = try testing.allocator.alloc(u8, cols * 4);
+    defer testing.allocator.free(graphemes);
+
+    var previous: u64 = 0;
+    var staged: usize = 0;
+    var refused_in_entries: u64 = 0;
+    var info: DepartureRow = undefined;
+    while (true) {
+        var needed: usize = 0;
+        const result = departure_drain_row(
+            t,
+            &info,
+            cells.ptr,
+            cells.len,
+            graphemes.ptr,
+            graphemes.len,
+            &needed,
+        );
+        if (result == .no_value) break;
+        try testing.expectEqual(Result.success, result);
+        try testing.expectEqual(previous + info.refused_before + 1, info.odometer);
+        refused_in_entries += info.refused_before;
+        previous = info.odometer;
+        staged += 1;
+    }
+
+    try testing.expectEqual(st.pending, staged);
+    try testing.expectEqual(st.odometer, @as(u64, @intCast(staged)) + refused_in_entries + st.refused_rows);
+    try testing.expectEqual(st.odometer - previous, st.refused_rows);
+    try testing.expectEqual(previous, st.refused_from);
 }
 
 test "a scroll then a full reset in one write keeps the departed rows" {

@@ -1553,8 +1553,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * active area, before any retention decision, for the embedder to
    * drain. Its staging is bounded: a crossing the bound refuses is
    * counted (the odometer advances) and surfaced through the departure
-   * status, never silently dropped. Lowering the bound never drops what
-   * is already staged. A NULL value pointer restores the default bound.
+   * status, never silently dropped. The byte bound charges row buffers,
+   * Entry-list capacity and temporary capture or list-growth allocations.
+   * Lowering the bound never drops what is already staged. A NULL value
+   * pointer restores the default bound.
    *
    * The bound is the embedder's byte budget to set; see the Departure
    * Journal section of departures.h for the full contract.

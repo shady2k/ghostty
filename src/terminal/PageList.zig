@@ -3992,16 +3992,9 @@ fn growInternal(
 ) Allocator.Error!?*List.Node {
     defer self.assertIntegrity();
 
-    // A successful growth moves the old top row into history. Only callers
-    // that performed a real scroll mark this as a departure; resize and
-    // reflow may grow the active area without crossing the primary boundary.
-    var crossed = false;
-    defer if (capture_departure and crossed) {
-        if (self.departures) |d| {
-            const depth = departurespkg.Departures.historyRows(self);
-            if (depth > 0) d.captureHistoryRows(self, depth - 1, depth);
-        }
-    };
+    // A successful growth moves the old top row into history. Capture it
+    // before any retention can recycle the page that contains it.
+    var captured_before_prune = false;
 
     // Growing can move a complete page behind the active boundary.
     self.page_compression.markActivity();
@@ -4014,6 +4007,9 @@ fn growInternal(
         // because the page memory was never used (pool buffers are
         // zeroed) or because whatever retired the row reset it (see
         // Page.resetRow).
+        if (capture_departure) {
+            if (self.departures) |d| d.captureTopRow(self);
+        }
         const page = last.page();
         page.size.rows += 1;
         page.assertIntegrity();
@@ -4024,7 +4020,6 @@ fn growInternal(
         // Growing inside the last page moves the active boundary without
         // allocating; that alone can make the first page wholly historical.
         self.limits.enforce(self, .lines);
-        crossed = true;
         return null;
     }
 
@@ -4046,21 +4041,29 @@ fn growInternal(
         self.pages.first != self.pages.last and
         self.page_size + PagePool.item_size > self.limits.max(.bytes))
     prune: {
+        const first_before = self.pages.first.?;
+        const first_rows = first_before.rows();
+        // If removing the first page would leave too few rows for the active
+        // area, leave it in place and take the allocation path below.
+        if (self.total_rows - first_rows + 1 < self.rows) break :prune;
+
+        // The first page may still contain the active top row when a custom
+        // or fragmented layout is tighter than the standard minimum. Stage
+        // that crossing before popping or reusing the page.
+        const history_depth = departurespkg.Departures.historyRows(self);
+        if (capture_departure and history_depth < first_rows) {
+            if (self.departures) |d| {
+                d.captureTopRow(self);
+                captured_before_prune = true;
+            }
+        }
+
         const first = self.pages.popFirst().?;
+        assert(first == first_before);
         assert(first != last);
 
         // Decrease our total row count from the pruned page
         self.total_rows -= first.rows();
-
-        // If our total row count is now less than our required
-        // rows then we can't prune. The "+ 1" is because we'll add one
-        // more row below.
-        if (self.total_rows + 1 < self.rows) {
-            self.pages.prepend(first);
-            assert(self.pages.first == first);
-            self.total_rows += first.rows();
-            break :prune;
-        }
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4127,10 +4130,21 @@ fn growInternal(
 
         page.assertIntegrity();
 
+        // If the recycled page was wholly historical, the departing active
+        // row is still at the history tail. Capture it before the independent
+        // line limit can prune that page. When the old active top was in the
+        // recycled page, it was already staged above.
+        if (capture_departure and !captured_before_prune) {
+            if (self.departures) |d| {
+                const depth = departurespkg.Departures.historyRows(self);
+                assert(depth > 0);
+                d.captureHistoryRows(self, depth - 1, depth);
+            }
+        }
+
         // Byte-limit recycling may leave history above the independent line
         // limit, so enforce it after the recycled page becomes the new tail.
         self.limits.enforce(self, .lines);
-        crossed = true;
         return first;
     }
 
@@ -4149,10 +4163,19 @@ fn growInternal(
     // Record the increased row count
     self.total_rows += 1;
 
+    // The old active top is the new history tail. Stage it before line-limit
+    // enforcement can remove the page it lives in.
+    if (capture_departure) {
+        if (self.departures) |d| {
+            const depth = departurespkg.Departures.historyRows(self);
+            assert(depth > 0);
+            d.captureHistoryRows(self, depth - 1, depth);
+        }
+    }
+
     // Appending a page can cross the line limit and can make the oldest
     // active-boundary page wholly historical.
     self.limits.enforce(self, .lines);
-    crossed = true;
     return next_node;
 }
 

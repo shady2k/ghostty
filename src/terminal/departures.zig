@@ -49,7 +49,7 @@ pub const default_max_bytes: usize = 8 * 1024 * 1024;
 /// grapheme clusters of multi-codepoint cells, encoded as UTF-8.
 ///
 /// `refused_before` carries the crossings the bound refused immediately
-/// before this row was staged: their odometer values are
+/// before this row was staged: their odometer span is
 /// `[odometer - refused_before, odometer)`. A consumer draining this entry
 /// knows exactly which rows it never received.
 pub const Entry = struct {
@@ -58,6 +58,7 @@ pub const Entry = struct {
     cols: u16,
     wrap: bool,
     wrap_continuation: bool,
+    allocation_bytes: usize = 0,
     cells: []Cell,
     /// Entry-local style table. A cell's `style_id` indexes this table; id 0
     /// is the default style and `styles[0]` is never read.
@@ -74,14 +75,10 @@ pub const Entry = struct {
         len: u16,
     };
 
-    /// The bytes this entry charges against the staging bound: its whole
-    /// allocation footprint, not a symbolic per-row constant.
+    /// Bytes owned by this row's buffers. The Entry record itself is charged
+    /// through the backing ArrayList capacity, including unused slots.
     pub fn byteSize(self: *const Entry) usize {
-        return @sizeOf(Entry) +
-            self.cells.len * @sizeOf(Cell) +
-            self.styles.len * @sizeOf(Style) +
-            self.utf8.len +
-            self.clusters.len * @sizeOf(Cluster);
+        return self.allocation_bytes;
     }
 
     /// The style of one of this entry's cells: the entry-local table, or the
@@ -113,10 +110,95 @@ pub const Entry = struct {
 pub const Status = struct {
     odometer: u64,
     pending: usize,
+    /// Current charge: row buffers plus allocated Entry-list capacity.
     staged_bytes: usize,
+    /// High-water charge since the previous status read, including temporary copies.
     peak_bytes: usize,
     refused_rows: u64,
     refused_from: u64,
+};
+
+/// Allocator for one candidate row. It bounds and measures all row buffers,
+/// including temporary ArrayList growth copies, against the bytes left in the
+/// journal after its entry backing storage and already staged rows.
+const StagingAllocator = struct {
+    backing: Allocator,
+    limit: usize,
+    used: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *StagingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(
+        ptr: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *StagingAllocator = @ptrCast(@alignCast(ptr));
+        if (self.used > self.limit or len > self.limit - self.used) return null;
+        const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.used += len;
+        self.peak = @max(self.peak, self.used);
+        return result;
+    }
+
+    fn resize(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *StagingAllocator = @ptrCast(@alignCast(ptr));
+        if (new_len > memory.len and
+            (self.used > self.limit or new_len - memory.len > self.limit - self.used)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len >= memory.len) {
+            self.used += new_len - memory.len;
+        } else {
+            self.used -= memory.len - new_len;
+        }
+        self.peak = @max(self.peak, self.used);
+        return true;
+    }
+
+    fn remap(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        // A no-op remap needs no allocation. For every size change, force
+        // ArrayList through alloc/copy/free so the temporary copy is visible
+        // to this allocator and charged against the bound.
+        _ = ptr;
+        _ = alignment;
+        _ = ret_addr;
+        if (new_len == memory.len) return memory.ptr;
+        return null;
+    }
+
+    fn free(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *StagingAllocator = @ptrCast(@alignCast(ptr));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.used -= memory.len;
+    }
 };
 
 /// The departure journal. One instance serves the primary screen of one
@@ -127,29 +209,30 @@ pub const Departures = struct {
     /// Monotonic count of crossings, journaled or refused.
     odometer: u64 = 0,
 
-    /// The staging bound in bytes. Lowering it never drops what is already
-    /// staged; it refuses crossings until a drain frees their bytes.
+    /// The staging bound in bytes. It charges row buffers, Entry-list
+    /// capacity, and temporary capture/list-growth copies. Lowering it never
+    /// drops what is already staged; it refuses crossings until drains free
+    /// enough bytes.
     max_bytes: usize = default_max_bytes,
 
+    /// Live row buffers plus the full allocated capacity of the Entry list.
     staged_bytes: usize = 0,
     peak_bytes: usize = 0,
 
     /// Crossings refused since the last staged entry. They are the most
     /// recent crossings (nothing can cross without being staged or refused),
-    /// so the span is `[odometer - refused_pending, odometer)`.
+    /// so their odometer-boundary span is
+    /// `[odometer - refused_pending, odometer)`.
     refused_pending: u64 = 0,
 
     entries: std.ArrayListUnmanaged(Entry) = .empty,
-    /// Index of the oldest entry not yet drained. Entries below it are freed
-    /// and their space reusable; the list is compacted when it empties.
-    head: usize = 0,
 
     pub fn init(alloc: Allocator) Departures {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *Departures) void {
-        for (self.entries.items[self.head..]) |e| self.freeEntry(e);
+        for (self.entries.items) |e| self.freeEntry(e);
         self.entries.deinit(self.alloc);
         self.* = undefined;
     }
@@ -162,7 +245,7 @@ pub const Departures = struct {
 
     /// Entries staged and not yet drained.
     pub fn pending(self: *const Departures) usize {
-        return self.entries.items.len - self.head;
+        return self.entries.items.len;
     }
 
     /// The number of history rows above the active area of `pages`. This is
@@ -195,22 +278,57 @@ pub const Departures = struct {
     /// The oldest staged entry, without draining it. The entry stays valid
     /// until `popOldest` runs; staging more entries does not invalidate it.
     pub fn peekOldest(self: *Departures) ?*Entry {
-        if (self.head == self.entries.items.len) return null;
-        return &self.entries.items[self.head];
+        if (self.entries.items.len == 0) return null;
+        return &self.entries.items[0];
     }
 
-    /// Drain the oldest staged entry, freeing it. The bytes it charged are
-    /// returned to the staging budget.
+    /// Drain the oldest staged entry and compact the remaining prefix so
+    /// partial reads reuse Entry slots. When the queue empties, release its
+    /// backing storage and return those bytes to the staging budget.
     pub fn popOldest(self: *Departures) void {
-        const e = self.entries.items[self.head];
+        assert(self.entries.items.len > 0);
+        const e = self.entries.items[0];
         self.staged_bytes -= e.byteSize();
         self.freeEntry(e);
-        self.entries.items[self.head] = undefined;
-        self.head += 1;
-        if (self.head == self.entries.items.len) {
-            self.entries.clearRetainingCapacity();
-            self.head = 0;
+
+        const remaining = self.entries.items.len - 1;
+        if (remaining == 0) {
+            const metadata_bytes = self.entries.capacity * @sizeOf(Entry);
+            self.entries.deinit(self.alloc);
+            self.entries = .empty;
+            self.staged_bytes -= metadata_bytes;
+            return;
         }
+
+        std.mem.copyForwards(
+            Entry,
+            self.entries.items[0..remaining],
+            self.entries.items[1..],
+        );
+        self.entries.items[remaining] = undefined;
+        self.entries.items.len = remaining;
+    }
+
+    /// Ensure one Entry slot without exceeding the journal bound, including
+    /// both old and new backing arrays during a relocating growth.
+    fn reserveEntrySlot(self: *Departures) bool {
+        const needed = self.entries.items.len + 1;
+        if (self.entries.capacity >= needed) return true;
+
+        const current = self.staged_bytes;
+        const new_bytes = needed * @sizeOf(Entry);
+        if (current > self.max_bytes or new_bytes > self.max_bytes - current) return false;
+
+        const new_items = self.alloc.alloc(Entry, needed) catch return false;
+        @memcpy(new_items[0..self.entries.items.len], self.entries.items);
+
+        const old_bytes = self.entries.capacity * @sizeOf(Entry);
+        if (self.entries.capacity > 0) self.alloc.free(self.entries.allocatedSlice());
+        self.entries.items = new_items[0..self.entries.items.len];
+        self.entries.capacity = needed;
+        self.staged_bytes = current - old_bytes + new_bytes;
+        self.peak_bytes = @max(self.peak_bytes, current + new_bytes);
+        return true;
     }
 
     /// Stage the top row of the active area of `pages`: the row about to
@@ -266,7 +384,11 @@ pub const Departures = struct {
             .utf8 = &.{},
             .clusters = &.{},
         };
-        self.refused_pending = 0;
+
+        if (!self.reserveEntrySlot()) {
+            self.refusedAfterStage();
+            return;
+        }
 
         const rac = pin.rowAndCell();
         entry.wrap = rac.row.wrap;
@@ -275,41 +397,42 @@ pub const Departures = struct {
         const cells = pin.cells(.all);
         entry.cols = @intCast(cells.len);
 
-        // Stage the row, or refuse it whole. A partially staged row would be
-        // worse than a refused one: the consumer would read a row that never
-        // existed. Every failure path below lands in one refusal.
-        self.stageCells(pin, cells, &entry) catch {
+        var staging = StagingAllocator{
+            .backing = self.alloc,
+            .limit = if (self.staged_bytes <= self.max_bytes)
+                self.max_bytes - self.staged_bytes
+            else
+                0,
+        };
+
+        // Stage the row, or refuse it whole. The bounded allocator counts all
+        // buffers and temporary growth copies before they can exceed the one
+        // journal budget. A partially staged row would be worse than a
+        // refused one: the consumer would read a row that never existed.
+        stageCells(pin, cells, &entry, staging.allocator()) catch {
+            self.peak_bytes = @max(self.peak_bytes, self.staged_bytes + staging.peak);
             self.freeEntry(entry);
             self.refusedAfterStage();
             return;
         };
+        self.peak_bytes = @max(self.peak_bytes, self.staged_bytes + staging.peak);
 
-        const size = entry.byteSize();
-        if (self.staged_bytes + size > self.max_bytes) {
-            self.freeEntry(entry);
-            self.refusedAfterStage();
-            return;
-        }
-
-        self.entries.append(self.alloc, entry) catch {
-            self.freeEntry(entry);
-            self.refusedAfterStage();
-            return;
-        };
-
-        self.staged_bytes += size;
-        if (self.staged_bytes > self.peak_bytes) self.peak_bytes = self.staged_bytes;
+        entry.allocation_bytes = staging.used;
+        self.entries.appendAssumeCapacity(entry);
+        self.staged_bytes += entry.byteSize();
+        self.refused_pending = 0;
+        self.peak_bytes = @max(self.peak_bytes, self.staged_bytes);
     }
 
     /// Fill `entry` from the row at `pin`. Fails only on allocation
     /// failure; the caller turns failure into a refusal.
     fn stageCells(
-        self: *Departures,
         pin: PageList.Pin,
         cells: []Cell,
         entry: *Entry,
+        alloc: Allocator,
     ) Allocator.Error!void {
-        const dup = try self.alloc.dupe(Cell, cells);
+        const dup = try alloc.dupe(Cell, cells);
         // Transfer ownership immediately so capturePin's failure cleanup can
         // free this buffer if a later style/grapheme allocation fails.
         entry.cells = dup;
@@ -317,7 +440,7 @@ pub const Departures = struct {
         // The style table is entry-local: remap every distinct page style id
         // the row uses to its own index. Id 0 stays 0 (the default style).
         var styles: std.ArrayListUnmanaged(Style) = .empty;
-        errdefer styles.deinit(self.alloc);
+        errdefer styles.deinit(alloc);
         for (dup) |*cell| {
             if (cell.style_id == 0) continue;
             const resolved = pin.style(cell);
@@ -329,7 +452,7 @@ pub const Departures = struct {
                 }
             }
             if (local == 0) {
-                try styles.append(self.alloc, resolved);
+                try styles.append(alloc, resolved);
                 local = @intCast(styles.items.len);
             }
             cell.style_id = local;
@@ -341,30 +464,30 @@ pub const Departures = struct {
         // and resolves nothing. A cell without text carries no bytes; a
         // cell with text always does.
         var utf8: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer utf8.deinit(self.alloc);
+        errdefer utf8.deinit(alloc);
         var clusters: std.ArrayListUnmanaged(Entry.Cluster) = .empty;
-        errdefer clusters.deinit(self.alloc);
+        errdefer clusters.deinit(alloc);
         for (dup, 0..) |cell, i| {
             if (!cell.hasText()) continue;
             const extra = if (cell.hasGrapheme()) pin.grapheme(&cells[i]) orelse null else null;
             const off: u32 = @intCast(utf8.items.len);
             var enc: [4]u8 = undefined;
-            try appendCodepoint(self.alloc, &utf8, cell.codepoint(), &enc);
+            try appendCodepoint(alloc, &utf8, cell.codepoint(), &enc);
             if (extra) |cps| {
-                for (cps) |cp| try appendCodepoint(self.alloc, &utf8, cp, &enc);
+                for (cps) |cp| try appendCodepoint(alloc, &utf8, cp, &enc);
             }
             const len: u16 = @intCast(utf8.items.len - off);
             if (len == 0) continue;
-            try clusters.append(self.alloc, .{
+            try clusters.append(alloc, .{
                 .cell = @intCast(i),
                 .off = off,
                 .len = len,
             });
         }
 
-        entry.styles = try styles.toOwnedSlice(self.alloc);
-        entry.utf8 = try utf8.toOwnedSlice(self.alloc);
-        entry.clusters = try clusters.toOwnedSlice(self.alloc);
+        entry.styles = try styles.toOwnedSlice(alloc);
+        entry.utf8 = try utf8.toOwnedSlice(alloc);
+        entry.clusters = try clusters.toOwnedSlice(alloc);
     }
 
     fn appendCodepoint(
@@ -515,6 +638,149 @@ test "allocation failures while staging a row free every partial allocation" {
     }
 }
 
+test "prior budget refusals survive a later staging allocation failure" {
+    const testing = std.testing;
+    const Screen = @import("Screen.zig");
+
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 40,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+    });
+    defer s.deinit();
+
+    // A styled row needs a cell copy before its style-table allocation. The
+    // budget allows the first allocation only; the third cell copy is then
+    // failed by the allocator after two budget refusals.
+    try s.testWriteString("\x1b[31mstyled");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 2,
+    });
+    var d = Departures.init(failing.allocator());
+    d.setMaxBytes(@sizeOf(Entry) + 40 * @sizeOf(Cell));
+    d.captureTopRow(&s.pages);
+    d.captureTopRow(&s.pages);
+    d.setMaxBytes(null);
+    d.captureTopRow(&s.pages);
+
+    const status = d.status();
+    try testing.expectEqual(@as(u64, 3), status.odometer);
+    try testing.expectEqual(@as(u64, 3), status.refused_rows);
+    try testing.expectEqual(@as(u64, 0), status.refused_from);
+    d.deinit();
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "partial drains keep journal allocations within the staging bound" {
+    const testing = std.testing;
+    const Screen = @import("Screen.zig");
+
+    var s = try Screen.init(testing.io, testing.allocator, .{
+        .cols = 100,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+    });
+    defer s.deinit();
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var d = Departures.init(failing.allocator());
+    d.captureTopRow(&s.pages);
+    const one_row = d.status().staged_bytes;
+    try testing.expect(one_row > 0);
+    d.popOldest();
+
+    // One old row remains while each cycle stages a new one and drains only
+    // the oldest. The live queue stays at one or two rows, but an
+    // uncompacted ArrayList prefix would retain every historical Entry slot.
+    const bound = one_row * 4;
+    d.setMaxBytes(bound);
+    d.captureTopRow(&s.pages);
+    d.captureTopRow(&s.pages);
+    try testing.expectEqual(@as(usize, 2), d.pending());
+    d.popOldest();
+    for (0..128) |_| {
+        d.captureTopRow(&s.pages);
+        d.popOldest();
+    }
+
+    const current_allocated = failing.allocated_bytes - failing.freed_bytes;
+    const status = d.status();
+    try testing.expectEqual(@as(u64, 131), status.odometer);
+    try testing.expectEqual(@as(usize, 1), status.pending);
+    try testing.expectEqual(@as(u64, 0), status.refused_rows);
+    try testing.expect(status.peak_bytes <= bound);
+    try testing.expect(status.staged_bytes <= bound);
+    d.popOldest();
+    try testing.expectEqual(@as(usize, 0), d.status().staged_bytes);
+    try testing.expectEqual(failing.freed_bytes, failing.allocated_bytes);
+    d.deinit();
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try testing.expect(current_allocated <= bound);
+}
+
+test "minimum byte limit recycles only history before departure capture" {
+    const testing = std.testing;
+    var probe = try PageList.init(testing.allocator, .{ .cols = 80, .rows = 1 });
+    const page_rows = probe.pages.first.?.capacity().rows;
+    probe.deinit();
+    const active_rows: @TypeOf(page_rows) = page_rows + 1;
+
+    // The byte request is below every valid screen minimum. Limits reserves
+    // one page beyond the active viewport, so this active area spans two pages
+    // and the minimum allows three pages in total.
+    var pages = try PageList.init(testing.allocator, .{
+        .cols = 80,
+        .rows = active_rows,
+        .max_size = 1,
+    });
+    defer pages.deinit();
+    try testing.expect(pages.pages.first != pages.pages.last);
+    try testing.expectEqual(pages.pages.last, pages.pages.first.?.next);
+
+    // Fill the second page. The active top is its first page's final row.
+    while (pages.pages.last.?.rows() < pages.pages.last.?.capacity().rows) {
+        _ = try pages.grow();
+    }
+    try testing.expectEqual(page_rows - 1, Departures.historyRows(&pages));
+
+    var d = Departures.init(testing.allocator);
+    defer d.deinit();
+    pages.departures = &d;
+    const first_top = pages.pin(.{ .active = .{} }).?.rowAndCell().cell;
+    first_top.content.codepoint.data = 'A';
+    const two_page_size = pages.page_size;
+    _ = try pages.growAndCaptureDeparture();
+    try testing.expectEqual(@as(u64, 1), d.odometer);
+    try testing.expect(pages.page_size > two_page_size);
+
+    // Fill the third page until the minimum byte cap must recycle the first.
+    while (pages.pages.last.?.rows() < pages.pages.last.?.capacity().rows) {
+        _ = try pages.grow();
+    }
+    try testing.expectEqual(
+        @as(usize, 2) * page_rows - 1,
+        Departures.historyRows(&pages),
+    );
+    const second_top = pages.pin(.{ .active = .{} }).?.rowAndCell().cell;
+    second_top.content.codepoint.data = 'B';
+    const at_limit_page_size = pages.page_size;
+    _ = try pages.growAndCaptureDeparture();
+
+    // The first page was already wholly historical when recycled. Its prune
+    // must not consume this crossing or empty the post-growth history tail.
+    try testing.expectEqual(at_limit_page_size, pages.page_size);
+    try testing.expect(Departures.historyRows(&pages) > 0);
+    try testing.expectEqual(@as(u64, 2), d.odometer);
+    try testing.expectEqual(@as(usize, 2), d.pending());
+    const first_text = try entryText(testing.allocator, d.peekOldest().?);
+    defer testing.allocator.free(first_text);
+    try testing.expectEqualStrings("A", first_text);
+    d.popOldest();
+    const second_text = try entryText(testing.allocator, d.peekOldest().?);
+    defer testing.allocator.free(second_text);
+    try testing.expectEqualStrings("B", second_text);
+}
+
 test "zero retention journals every scrolled row" {
     // DONE WHEN (a): with no scrollback at all, a row that crosses the top
     // of the active area is erased in place and no depth ever grows; the
@@ -644,6 +910,8 @@ test "a same-feed prune advances the floor and never the odometer" {
         d.popOldest();
     }
     try testing.expect(drained_rows.items.len > 0);
+    const expected_departures: u64 = @intCast(total - s.pages.rows + 1);
+    try testing.expectEqual(expected_departures, d.odometer);
     try testing.expectEqual(d.odometer, drained_rows.items.len);
     for (drained_rows.items, 0..) |line, row_index| {
         try testing.expectEqualStrings(want.items[row_index], line);
@@ -653,10 +921,11 @@ test "a same-feed prune advances the floor and never the odometer" {
     // stood still — it counted only the feed's own crossings, exactly the
     // rows the drain returned, whatever retention did meanwhile.
     const depth = Departures.historyRows(&s.pages);
+    try testing.expect(depth <= 260);
     try testing.expect(d.odometer > depth);
     const retained_floor = d.odometer - depth;
+    try testing.expect(retained_floor >= expected_departures - 260);
     try testing.expect(retained_floor > 0);
-    try testing.expectEqual(d.odometer, retained_floor + depth);
 
     const st = statusOnce(&d);
     try testing.expectEqual(@as(u64, 0), st.refused_rows);

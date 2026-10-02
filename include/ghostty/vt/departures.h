@@ -64,11 +64,12 @@ typedef struct {
       interval boundary. */
   size_t pending;
 
-  /** Bytes currently staged, charged against the journal's bound. */
+  /** Bytes currently charged against the journal's bound: row buffers plus
+      the full Entry-list capacity, including unused slots. */
   size_t staged_bytes;
 
-  /** High-water staged bytes since the previous status call, for the
-      byte-credit pool this journal's staging spends. */
+  /** High-water charged bytes since the previous status call, including
+      temporary capture and Entry-list growth copies. */
   size_t peak_bytes;
 
   /** Crossings the bound refused since the previous status call. A
@@ -76,8 +77,8 @@ typedef struct {
       odometer counted it, the row's contents were not retained. */
   uint64_t refused_rows;
 
-  /** The odometer value of the first of those refused crossings. The
-      refused span is [refused_from, refused_from + refused_rows). */
+  /** The odometer boundary immediately before the trailing refused span.
+      The span is [refused_from, refused_from + refused_rows). */
   uint64_t refused_from;
 } GhosttyTerminalDepartureStatus;
 
@@ -122,7 +123,7 @@ typedef struct {
   uint64_t odometer;
 
   /** Crossings the bound refused immediately before this row was staged;
-      their odometer values are [odometer - refused_before, odometer). */
+      their odometer-boundary span is [odometer - refused_before, odometer). */
   uint64_t refused_before;
 
   /** The row's width at the moment it crossed. A resize never rewrites a
