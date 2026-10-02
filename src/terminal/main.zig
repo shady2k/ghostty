@@ -12,6 +12,7 @@ pub const point = @import("point.zig");
 pub const color = @import("color.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const device_attributes = @import("device_attributes.zig");
+pub const departures = @import("departures.zig");
 pub const device_status = @import("device_status.zig");
 pub const focus = @import("focus.zig");
 pub const formatter = @import("formatter.zig");

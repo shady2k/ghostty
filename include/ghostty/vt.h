@@ -37,6 +37,7 @@
  * - @ref sgr "SGR Parser" - Parse SGR (Select Graphic Rendition) sequences
  * - @ref paste "Paste" - Paste into a terminal, validate and encode paste data
  * - @ref unicode "Unicode Utilities" - Codepoint properties for text layout
+ * - @ref departures "Departure Journal" - Durable capture of rows that leave the primary screen
  * - @ref build_info "Build Info" - Query compile-time build configuration
  * - @ref allocator "Memory Management" - Memory management and custom allocators
  * - @ref io "Byte-stream I/O" - Reusable synchronous reader and writer callbacks
@@ -144,6 +145,7 @@ extern "C" {
 #include <ghostty/vt/allocator.h>
 #include <ghostty/vt/build_info.h>
 #include <ghostty/vt/color.h>
+#include <ghostty/vt/departures.h>
 #include <ghostty/vt/color_scheme.h>
 #include <ghostty/vt/device.h>
 #include <ghostty/vt/focus.h>

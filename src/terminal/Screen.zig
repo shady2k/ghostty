@@ -13,6 +13,7 @@ const sgr = @import("sgr.zig");
 const tripwire = @import("../tripwire.zig");
 const unicode = @import("../unicode/main.zig");
 const Selection = @import("Selection.zig");
+const departurespkg = @import("departures.zig");
 const PageList = @import("PageList.zig");
 const selection_codepoints = @import("selection_codepoints.zig");
 const StringMap = @import("StringMap.zig");
@@ -48,6 +49,12 @@ pages: PageList,
 /// this because max_size 0 in PageList gets rounded up to two pages so
 /// we can always have an active screen.
 no_scrollback: bool = false,
+
+/// The departure journal this screen stages its crossings into, or null
+/// when this screen departs nothing. The primary screen carries a journal
+/// (installed by its owner at construction); the alternate screen never
+/// does, so alternate-screen scrolling journals no rows.
+departures: ?*departurespkg.Departures = null,
 
 /// The current cursor position
 cursor: Cursor,
@@ -924,6 +931,16 @@ pub fn cursorDownScroll(self: *Screen) !void {
     assert(self.cursor.y == self.pages.rows - 1);
     defer self.assertIntegrity();
 
+    // The departure capture for the zero-scrollback branches below: the
+    // row is erased IN PLACE there, so this is the last instant it exists
+    // at all. The retained branch needs no capture here —
+    // growAndCaptureDeparture() stages the crossing from the history tail
+    // after growth succeeds. The alternate screen carries no journal and
+    // departs nothing.
+    if (self.no_scrollback) {
+        if (self.departures) |d| d.captureTopRow(&self.pages);
+    }
+
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
         self.kitty_images.dirty = true;
@@ -976,7 +993,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
         // Grow our pages by one row. The PageList will handle if we need to
         // allocate, prune scrollback, whatever.
-        _ = try self.pages.grow();
+        _ = try self.pages.growAndCaptureDeparture();
 
         const new_pin = new_pin: {
             // Calculate this before cursorChangePin because that function may
@@ -1083,7 +1100,7 @@ pub fn cursorScrollAbove(self: *Screen) !void {
     //  lot cheaper in 99% of cases.
 
     const old_pin = self.cursor.page_pin.*;
-    if (try self.pages.grow()) |new_node| {
+    if (try self.pages.growAndCaptureDeparture()) |new_node| {
         try self.cursorScrollAboveRotate(new_node);
     } else {
         // In this case, it means grow() didn't allocate a new page.
@@ -1265,6 +1282,14 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     assert(limit >= 1);
     assert(self.cursor.y >= limit);
     defer self.assertIntegrity();
+
+    // With no scrollback, the normal LF/IND path scrolls an in-place
+    // region instead of calling cursorDownScroll. When that region begins
+    // at the primary active-area top, its first row is the departure and
+    // must be captured before the fast clear or slow erase mutates it.
+    if (self.no_scrollback and self.cursor.y == limit) {
+        if (self.departures) |d| d.captureTopRow(&self.pages);
+    }
 
     const pin: *Pin = self.cursor.page_pin;
 
