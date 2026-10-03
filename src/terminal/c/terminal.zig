@@ -6916,12 +6916,7 @@ test "C width and row shrink capture rows before reflow" {
     }
 }
 
-test "a shrink while the alternate screen holds the pane emits once" {
-    // DONE WHEN (c): a shrink resizes the hidden primary screen too, and
-    // the rows it pushes out of the primary active area cross the top of
-    // the primary screen. They are staged at the resize, exactly once,
-    // and not again when the alternate screen returns - nor when more
-    // output scrolls the alternate screen in between.
+test "a combined shrink captures original styled wrapped rows before zero-retention prune" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -6931,77 +6926,114 @@ test "a shrink while the alternate screen holds the pane emits once" {
     ));
     defer free(t);
 
-    // Fill the primary screen with content that scrolls.
-    var feed: std.ArrayList(u8) = .empty;
-    defer feed.deinit(testing.allocator);
-    var want: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (want.items) |w| testing.allocator.free(w);
-        want.deinit(testing.allocator);
-    }
-    var i: usize = 0;
-    while (i < 20) : (i += 1) {
-        var buf: [32]u8 = undefined;
-        const line = try std.fmt.bufPrint(&buf, "primary-{d:0>2}", .{i});
-        try feed.appendSlice(testing.allocator, line);
-        try feed.appendSlice(testing.allocator, "\r\n");
-        try want.append(testing.allocator, try testing.allocator.dupe(u8, line));
-    }
-    vt_write(t, feed.items.ptr, feed.items.len);
+    // The live history is pruned at the resize boundary, but the journal must
+    // preserve the original 20-column source rows before reflow and pruning.
+    const zero: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &zero));
+    const feed = "\x1b[1;31mABCDEFGHIJKLMNOPQRSTU\x1b[0m\r\n" ++
+        "row-02\r\nrow-03\r\nrow-04\r\nrow-05\r\n" ++
+        "row-06\r\nrow-07\r\nrow-08\r\nrow-09";
+    vt_write(t, feed, feed.len);
 
-    // Everything crossed before the alternate screen went up; drain it so
-    // the measurement below sees only what the shrink emits.
-    {
-        const lines = try drainDepartureText(t, testing.allocator);
-        defer {
-            for (lines) |l| testing.allocator.free(l);
-            testing.allocator.free(lines);
-        }
-        try testing.expect(lines.len > 0);
-    }
-    var st: DepartureStatus = undefined;
-    try testing.expectEqual(Result.success, departure_status(t, &st));
-    const odometer_before_shrink = st.odometer;
+    var before: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &before));
+    try testing.expectEqual(@as(u64, 0), before.odometer);
+    try testing.expectEqual(@as(usize, 0), before.pending);
 
-    // The alternate screen takes the pane; a shrink pushes the primary's
-    // top rows out of its active area.
+    // The primary is hidden while both dimensions shrink. The live-history
+    // prune that follows must not replace the rows the journal records.
     vt_write(t, "\x1b[?1049h", 8);
+    try testing.expectEqual(Result.success, resize(t, 10, 6, 0, 0));
+    const primary = t.?.stream.handler.terminal.screens.get(.primary).?;
     try testing.expectEqual(
-        Result.success,
-        resize(t, 20, 6, 0, 0),
+        @as(usize, 0),
+        departures.Departures.historyRows(&primary.pages),
     );
 
-    const lines = try drainDepartureText(t, testing.allocator);
-    defer {
-        for (lines) |l| testing.allocator.free(l);
-        testing.allocator.free(lines);
+    var staged: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &staged));
+    try testing.expectEqual(before.odometer + 4, staged.odometer);
+    try testing.expectEqual(@as(usize, 4), staged.pending);
+    try testing.expectEqual(@as(u64, 0), staged.refused_rows);
+    const journal_budget: usize = 32 * 1024 * 1024;
+    try testing.expect(staged.staged_bytes > 0);
+    try testing.expect(staged.staged_bytes <= journal_budget);
+    try testing.expect(staged.peak_bytes <= journal_budget);
+
+    const expected = [_][]const u8{
+        "ABCDEFGHIJKLMNOPQRST",
+        "U",
+        "row-02",
+        "row-03",
+    };
+    var info: DepartureRow = undefined;
+    var cells: [20]DepartureCell = undefined;
+    var graphemes: [256]u8 = undefined;
+    var needed: usize = 0;
+    for (expected, 0..) |expected_text, row_index| {
+        try testing.expectEqual(Result.success, departure_drain_row(
+            t,
+            &info,
+            &cells,
+            cells.len,
+            &graphemes,
+            graphemes.len,
+            &needed,
+        ));
+        try testing.expectEqual(@as(u64, @intCast(row_index + 1)), info.odometer);
+        try testing.expectEqual(@as(u16, 20), info.cols);
+        const text = try rowText(
+            testing.allocator,
+            cells[0..info.cols],
+            graphemes[0..],
+        );
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings(expected_text, text);
+
+        if (row_index == 0) {
+            try testing.expect(info.wrap);
+            try testing.expect(!info.continuation);
+            try testing.expect(cells[0].styled);
+            try testing.expect(cells[0].style.bold);
+        } else if (row_index == 1) {
+            try testing.expect(!info.wrap);
+            try testing.expect(info.continuation);
+            try testing.expect(cells[0].styled);
+            try testing.expect(cells[0].style.bold);
+        } else {
+            try testing.expect(!info.wrap);
+            try testing.expect(!info.continuation);
+        }
     }
+    try testing.expectEqual(Result.no_value, departure_drain_row(
+        t,
+        &info,
+        &cells,
+        cells.len,
+        &graphemes,
+        graphemes.len,
+        &needed,
+    ));
 
-    // The four rows the shrink pushed off, once, in order. A later return
-    // to primary must not replay any of these rows.
-    try testing.expectEqual(@as(usize, 4), lines.len);
-    for (lines, 11..) |line, row_index| {
-        try testing.expectEqualStrings(want.items[row_index], line);
-    }
+    var drained: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &drained));
+    try testing.expectEqual(staged.odometer, drained.odometer);
+    try testing.expectEqual(@as(usize, 0), drained.pending);
+    // Entry-slot capacity remains allocated and charged after draining; row
+    // payload bytes are released, while the retained capacity stays bounded.
+    try testing.expect(drained.staged_bytes < staged.staged_bytes);
+    try testing.expect(drained.staged_bytes <= journal_budget);
 
-    try testing.expectEqual(Result.success, departure_status(t, &st));
-    const odometer_after_shrink = st.odometer;
-    try testing.expectEqual(odometer_before_shrink + 4, odometer_after_shrink);
-    try testing.expectEqual(@as(usize, 0), st.pending);
-
-    // More output on the alternate screen emits nothing and does not move
-    // the primary odometer.
+    // Neither alternate output nor returning to primary replays a crossing.
     const alt_feed = "\x1b[?1049hmore-alt-output\r\nmore-alt-output\r\n";
     vt_write(t, alt_feed, alt_feed.len);
-    try testing.expectEqual(Result.success, departure_status(t, &st));
-    try testing.expectEqual(odometer_after_shrink, st.odometer);
-    try testing.expectEqual(@as(usize, 0), st.pending);
-
-    // Returning to primary does not replay rows or advance its odometer.
+    try testing.expectEqual(Result.success, departure_status(t, &drained));
+    try testing.expectEqual(staged.odometer, drained.odometer);
+    try testing.expectEqual(@as(usize, 0), drained.pending);
     vt_write(t, "\x1b[?1049l", 8);
-    try testing.expectEqual(Result.success, departure_status(t, &st));
-    try testing.expectEqual(odometer_after_shrink, st.odometer);
-    try testing.expectEqual(@as(usize, 0), st.pending);
+    try testing.expectEqual(Result.success, departure_status(t, &drained));
+    try testing.expectEqual(staged.odometer, drained.odometer);
+    try testing.expectEqual(@as(usize, 0), drained.pending);
 }
 
 test "wide bounded output reports every trailing refusal through the C API" {
@@ -7585,6 +7617,171 @@ test "a scroll clear journals the rows it pushes into history" {
     const expected = [_][]const u8{ "sc-1", "sc-2", "sc-3", "sc-4", "sc-5", "sc-6" };
     try testing.expectEqual(expected.len, lines.len);
     for (lines, expected) |line, want| try testing.expectEqualStrings(want, line);
+}
+
+test "C combined width and row shrink fails cleanly at every allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 24));
+    defer free(t);
+
+    const zero_bytes: usize = 0;
+    try testing.expectEqual(Result.success, set(t, .departure_max_bytes, &zero_bytes));
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..128) |i| {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>5}\r\n", .{i});
+        try feed.appendSlice(testing.allocator, line);
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    // A row-only shrink has no fallible work on this populated screen.
+    const before_row_shrink_allocs = failing.alloc_index;
+    failing.fail_index = before_row_shrink_allocs;
+    try testing.expectEqual(Result.success, resize(t, 10, 12, 0, 0));
+    try testing.expectEqual(before_row_shrink_allocs, failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, resize(t, 10, 24, 0, 0));
+
+    var ignored: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &ignored));
+    var stable_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &stable_status));
+
+    const wrapper = t.?;
+    const native = wrapper.stream.handler.terminal;
+    const primary = native.screens.get(.primary).?;
+    const before = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(before);
+    const before_total_rows = primary.pages.total_rows;
+    const before_cursor_x = primary.cursor.x;
+    const before_cursor_y = primary.cursor.y;
+    const before_cursor_pin = primary.cursor.page_pin;
+    const before_cursor_pin_value = before_cursor_pin.*;
+
+    // The baseline failed at offset one after tabstop setup, when the
+    // in-place path allocated its reflow destination. Sweep every allocation
+    // in the transactional path as well.
+    var failure_offset: usize = 0;
+    while (failure_offset < 256) : (failure_offset += 1) {
+        failing.fail_index = failing.alloc_index + failure_offset;
+        const resize_result = resize(t, 5, 12, 0, 0);
+        if (resize_result == .success) break;
+        try testing.expectEqual(Result.out_of_memory, resize_result);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expectEqual(@as(usize, 10), native.cols);
+        try testing.expectEqual(@as(usize, 24), native.rows);
+        try testing.expectEqual(before_total_rows, primary.pages.total_rows);
+        try testing.expectEqual(before_cursor_x, primary.cursor.x);
+        try testing.expectEqual(before_cursor_y, primary.cursor.y);
+        try testing.expectEqual(before_cursor_pin, primary.cursor.page_pin);
+        try testing.expectEqual(before_cursor_pin_value, primary.cursor.page_pin.*);
+
+        const after = try primary.dumpStringAllocUnwrapped(
+            testing.allocator,
+            .{ .screen = .{} },
+        );
+        defer testing.allocator.free(after);
+        try testing.expectEqualStrings(before, after);
+
+        var after_status: DepartureStatus = undefined;
+        try testing.expectEqual(Result.success, departure_status(t, &after_status));
+        try testing.expectEqual(stable_status.odometer, after_status.odometer);
+        try testing.expectEqual(stable_status.pending, after_status.pending);
+        try testing.expectEqual(stable_status.staged_bytes, after_status.staged_bytes);
+        try testing.expectEqual(stable_status.peak_bytes, after_status.peak_bytes);
+        try testing.expectEqual(stable_status.refused_rows, after_status.refused_rows);
+        try testing.expectEqual(stable_status.refused_from, after_status.refused_from);
+
+        // After the second injected OOM point, exercise the C write and read
+        // APIs before continuing through the remaining fail points.
+        if (failure_offset == 1) {
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(@as(usize, 0), primary.cursor.x);
+            try testing.expectEqual(@as(usize, 23), primary.cursor.y);
+            const bottom_left: point.Point.C = .{
+                .tag = .active,
+                .value = .{ .active = .{ .x = 0, .y = 23 } },
+            };
+            vt_write(t, "Z", 1);
+            var immediate_ref: grid_ref_c.CGridRef = .{};
+            try testing.expectEqual(Result.success, grid_ref(t, bottom_left, &immediate_ref));
+            var immediate_cell: cell_c.CCell = undefined;
+            try testing.expectEqual(
+                Result.success,
+                grid_ref_c.grid_ref_cell(&immediate_ref, &immediate_cell),
+            );
+            var immediate_codepoint: u32 = 0;
+            try testing.expectEqual(
+                Result.success,
+                cell_c.get(immediate_cell, .codepoint, @ptrCast(&immediate_codepoint)),
+            );
+            try testing.expectEqual(@as(u32, 'Z'), immediate_codepoint);
+            vt_write(t, "\x1b[2K", "\x1b[2K".len);
+            vt_write(t, "\x1b[24;1H", "\x1b[24;1H".len);
+            try testing.expectEqual(before_cursor_pin, primary.cursor.page_pin);
+            try testing.expectEqual(before_cursor_pin_value, primary.cursor.page_pin.*);
+            const restored = try primary.dumpStringAllocUnwrapped(
+                testing.allocator,
+                .{ .screen = .{} },
+            );
+            defer testing.allocator.free(restored);
+            try testing.expectEqualStrings(before, restored);
+
+            var after_probe_status: DepartureStatus = undefined;
+            try testing.expectEqual(Result.success, departure_status(t, &after_probe_status));
+            try testing.expectEqual(stable_status.odometer, after_probe_status.odometer);
+            try testing.expectEqual(stable_status.pending, after_probe_status.pending);
+            try testing.expectEqual(stable_status.staged_bytes, after_probe_status.staged_bytes);
+            try testing.expectEqual(stable_status.refused_rows, after_probe_status.refused_rows);
+            try testing.expectEqual(stable_status.refused_from, after_probe_status.refused_from);
+        }
+    } else {
+        return error.ResizeFailureInjectionLimitExceeded;
+    }
+    try testing.expect(failure_offset >= 2);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(usize, 5), native.cols);
+    try testing.expectEqual(@as(usize, 12), native.rows);
+    var success_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &success_status));
+    try testing.expect(success_status.odometer > stable_status.odometer);
+    try testing.expectEqual(
+        success_status.odometer - stable_status.odometer,
+        success_status.refused_rows,
+    );
+    try testing.expectEqual(stable_status.odometer, success_status.refused_from);
+    try testing.expectEqual(@as(usize, 0), success_status.pending);
+    try testing.expectEqual(@as(usize, 0), success_status.staged_bytes);
+
+    // The C terminal accepts output, exposes it through a grid reference, and
+    // remains resizable after all injected failures.
+    try testing.expect(!primary.cursor.pending_wrap);
+    const probe_point: point.Point.C = .{
+        .tag = .active,
+        .value = .{ .active = .{
+            .x = @intCast(primary.cursor.x),
+            .y = @intCast(primary.cursor.y),
+        } },
+    };
+    vt_write(t, "Z", 1);
+    var read_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, probe_point, &read_ref));
+    var rendered: cell_c.CCell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&read_ref, &rendered));
+    var codepoint: u32 = 0;
+    try testing.expectEqual(Result.success, cell_c.get(rendered, .codepoint, @ptrCast(&codepoint)));
+    try testing.expectEqual(@as(u32, 'Z'), codepoint);
+    try testing.expectEqual(Result.success, resize(t, 10, 24, 0, 0));
 }
 
 test "C width resize fails cleanly at every allocation" {

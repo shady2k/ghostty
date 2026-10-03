@@ -1284,36 +1284,54 @@ pub const Resize = struct {
     };
 };
 
+/// A range of history rows that crossed the active boundary during a resize.
+const DepartureCapture = struct {
+    from: usize,
+    to: usize,
+};
+
 /// Resize
 /// TODO: docs
 /// Apply the row-count part of resize and stage any rows that leave the
 /// active area before `resize` enforces the history limits. Reflow-only row
-/// movement is deliberately outside this boundary.
+/// movement is deliberately outside this boundary. A transaction can request
+/// the crossing range instead, so it stages those original rows only at commit.
 fn resizeWithoutReflowAndCapture(
     self: *PageList,
     opts: Resize,
+    deferred_capture: ?*?DepartureCapture,
 ) Allocator.Error!void {
     const before = departurespkg.Departures.historyRows(self);
     try self.resizeWithoutReflow(opts);
     const after = departurespkg.Departures.historyRows(self);
     if (after > before) {
-        if (self.departures) |d| d.captureHistoryRows(self, before, after);
+        if (deferred_capture) |capture| {
+            capture.* = .{ .from = before, .to = after };
+        } else if (self.departures) |d| {
+            d.captureHistoryRows(self, before, after);
+        }
     }
 }
 
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     const cols = opts.cols orelse self.cols;
+    const rows_unchanged = if (opts.rows) |rows| rows == self.rows else true;
+    const rows_shrink = if (opts.rows) |rows| rows < self.rows else false;
+    // A combined shrink changes the active boundary before column reflow. Keep
+    // both steps speculative so a later reflow OOM cannot expose half a resize.
     if (opts.reflow and cols != self.cols and
-        (opts.rows == null or opts.rows.? == self.rows))
+        (rows_unchanged or (cols < self.cols and rows_shrink)))
     {
         return self.resizeColsTransactional(opts);
     }
-    return self.resizeInPlace(opts, true);
+    return self.resizeInPlace(opts, true, null);
 }
 
 /// A width reflow is built on an independent copy so allocator failure cannot
-/// expose its partially rewritten page list through the live terminal.
+/// expose its partially rewritten page list through the live terminal. Combined
+/// row/column shrink uses the same boundary because row shrink runs first.
 fn resizeColsTransactional(self: *PageList, opts: Resize) Allocator.Error!void {
+    const cols = opts.cols orelse self.cols;
     var pin_remap: Clone.TrackedPinsRemap = .init(self.pool.alloc);
     defer pin_remap.deinit();
 
@@ -1342,7 +1360,15 @@ fn resizeColsTransactional(self: *PageList, opts: Resize) Allocator.Error!void {
         resized.untrackPin(cloned);
     }
 
-    resized.departures = self.departures;
+    // Journal writes belong to the transaction boundary, not the speculative
+    // combined-shrink clone: width reflow can still fail after rows move into
+    // history. Record that boundary range and stage it only at commit. The
+    // width-only transaction keeps its existing capture wiring unchanged.
+    const defer_departure_capture = if (opts.rows) |rows|
+        cols < self.cols and rows < self.rows
+    else
+        false;
+    resized.departures = if (defer_departure_capture) null else self.departures;
     resized.page_serial_epoch = self.page_serial_epoch;
     // Give cloned pages fresh serials so a pre-resize page reference cannot
     // become valid again merely because its coordinates happen to match.
@@ -1361,7 +1387,12 @@ fn resizeColsTransactional(self: *PageList, opts: Resize) Allocator.Error!void {
         }
     }
 
-    try resized.resizeInPlace(resized_opts, false);
+    var deferred_departure_capture: ?DepartureCapture = null;
+    const deferred_capture: ?*?DepartureCapture = if (defer_departure_capture)
+        &deferred_departure_capture
+    else
+        null;
+    try resized.resizeInPlace(resized_opts, false, deferred_capture);
 
     // Keep an untracked viewport pin in place across transactions. When the
     // old viewport pin is a stable tracked identity, allocate a replacement
@@ -1373,6 +1404,14 @@ fn resizeColsTransactional(self: *PageList, opts: Resize) Allocator.Error!void {
         try self.pool.pins.create();
     errdefer if (!reuse_viewport_pin) self.pool.pins.destroy(replacement_viewport_pin);
     replacement_viewport_pin.* = resized.viewport_pin.*;
+
+    // The clone has now completed every fallible step. Capture row-count
+    // departures from the still-intact source pages before remapping their
+    // pins and committing the replacement list.
+    if (deferred_departure_capture) |capture| {
+        if (self.departures) |d| d.captureHistoryRows(self, capture.from, capture.to);
+    }
+    resized.departures = self.departures;
 
     // Keep existing Pin addresses stable for Screen, selections and C grid
     // references. Their new values point into the completed cloned list.
@@ -1401,6 +1440,7 @@ fn resizeInPlace(
     self: *PageList,
     opts: Resize,
     assert_on_error: bool,
+    deferred_capture: ?*?DepartureCapture,
 ) Allocator.Error!void {
     var succeeded = false;
     defer if (succeeded or assert_on_error) self.assertIntegrity();
@@ -1425,7 +1465,7 @@ fn resizeInPlace(
     self.viewport_pin_row_offset = null;
 
     if (!opts.reflow) {
-        try self.resizeWithoutReflowAndCapture(opts);
+        try self.resizeWithoutReflowAndCapture(opts, deferred_capture);
         // Shrinking the active row count turns former active rows into
         // scrollback even without reflow, which can cross the line limit.
         self.limits.enforce(self, .lines);
@@ -1447,13 +1487,13 @@ fn resizeInPlace(
     // on the change of columns.
     const cols = opts.cols orelse self.cols;
     switch (std.math.order(cols, self.cols)) {
-        .eq => try self.resizeWithoutReflowAndCapture(opts),
+        .eq => try self.resizeWithoutReflowAndCapture(opts, deferred_capture),
 
         .gt => {
             // We grow rows after cols so that we can do our unwrapping/reflow
             // before we do a no-reflow grow.
             try self.resizeCols(cols, opts.cursor);
-            try self.resizeWithoutReflowAndCapture(opts);
+            try self.resizeWithoutReflowAndCapture(opts, deferred_capture);
         },
 
         .lt => {
@@ -1463,7 +1503,7 @@ fn resizeInPlace(
                 var copy = opts;
                 copy.cols = self.cols;
                 break :opts copy;
-            });
+            }, deferred_capture);
             try self.resizeCols(cols, opts.cursor);
         },
     }
