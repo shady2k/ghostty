@@ -9498,6 +9498,7 @@ test "PageList compression restores through page access" {
     defer cloned.deinit();
     try testing.expect(node.isCompressed());
     try testing.expectEqual(before_clone_stats, s.memoryStats());
+    try testing.expectEqual(before_clone_activity, s.page_compression.activity_serial);
     try testing.expectEqual(
         @as(u21, 'X'),
         cloned.pages.first.?.page().getRowAndCell(3, 2).cell.content.codepoint.data,
