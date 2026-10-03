@@ -7072,6 +7072,193 @@ test "a scroll then a full reset in one write keeps the departed rows" {
     try testing.expectEqualStrings("reset-00", lines[0]);
 }
 
+test "C width reflow preserves rendered style and wide cells on OOM and success" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 4));
+    defer free(t);
+
+    const input = "\x1b[1;31mR界\x1b[0m";
+    vt_write(t, input.ptr, input.len);
+
+    const c_point: point.Point.C = .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 0, .y = 0 } },
+    };
+    var original_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, c_point, &original_ref));
+
+    // Fail the first allocation in the C width resize. The caller's existing
+    // grid ref remains valid and still exposes the rendered style and wide
+    // flags, not only the same text snapshot.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(Result.out_of_memory, resize(t, 5, 4, 0, 0));
+    var after_failure_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, c_point, &after_failure_ref));
+    try testing.expectEqual(original_ref.node, after_failure_ref.node);
+    var cell: cell_c.CCell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&original_ref, &cell));
+    var codepoint: u32 = 0;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .codepoint, @ptrCast(&codepoint)));
+    try testing.expectEqual(@as(u32, 'R'), codepoint);
+    var styled: bool = false;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .has_styling, @ptrCast(&styled)));
+    try testing.expect(styled);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, resize(t, 5, 4, 0, 0));
+
+    const expected = [_]struct {
+        x: size.CellCountInt,
+        codepoint: u32,
+        wide: cell_c.Wide,
+    }{
+        .{ .x = 0, .codepoint = 'R', .wide = .narrow },
+        .{ .x = 1, .codepoint = '界', .wide = .wide },
+        .{ .x = 2, .codepoint = 0, .wide = .spacer_tail },
+    };
+    for (expected) |want| {
+        var ref: grid_ref_c.CGridRef = .{};
+        try testing.expectEqual(Result.success, grid_ref(t, .{
+            .tag = .active,
+            .value = .{ .active = .{ .x = want.x, .y = 0 } },
+        }, &ref));
+        var rendered: cell_c.CCell = undefined;
+        try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&ref, &rendered));
+        var got_codepoint: u32 = 0;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .codepoint,
+            @ptrCast(&got_codepoint),
+        ));
+        try testing.expectEqual(want.codepoint, got_codepoint);
+        var got_wide: cell_c.Wide = .narrow;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .wide,
+            @ptrCast(&got_wide),
+        ));
+        try testing.expectEqual(want.wide, got_wide);
+        var got_styled: bool = false;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .has_styling,
+            @ptrCast(&got_styled),
+        ));
+        try testing.expect(got_styled);
+    }
+}
+
+test "C failed width resize preserves cold compressed history state" {
+    const lines: usize = 10_000;
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..lines) |i| {
+        var line_buf: [24]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "history-{d:0>4}\r\n", .{i});
+        try feed.appendSlice(testing.allocator, line);
+    }
+
+    // First run a successful resize on an identical terminal to place the
+    // injected OOM at the last destination-page allocation in the failure run,
+    // after clone has inspected the cold compressed source page.
+    var measured = testing.FailingAllocator.init(testing.allocator, .{});
+    var measured_zig_alloc = measured.allocator();
+    const measured_c_alloc = lib.alloc.Allocator.fromZig(&measured_zig_alloc);
+    var measured_t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&measured_c_alloc, &measured_t, 10, 4));
+    defer free(measured_t);
+    measured_t.?.stream.handler.terminal.setScrollbackMaxBytes(null);
+    vt_write(measured_t, feed.items.ptr, feed.items.len);
+    const measured_native = measured_t.?.stream.handler.terminal;
+    const measured_primary = measured_native.screens.get(.primary).?;
+    _ = measured_primary.pages.compress(.full);
+    var measured_compressed_node = measured_primary.pages.pages.first.?;
+    var measured_history_y: usize = 0;
+    while (measured_compressed_node.storage() != .compressed) {
+        measured_history_y += measured_compressed_node.rows();
+        measured_compressed_node = measured_compressed_node.next orelse
+            return error.NoCompressedHistory;
+    }
+    var measured_tracked: grid_ref_tracked_c.CTrackedGridRef = null;
+    try testing.expectEqual(Result.success, grid_ref_track(measured_t, .{
+        .tag = .history,
+        .value = .{ .history = .{ .x = 0, .y = @intCast(measured_history_y) } },
+    }, &measured_tracked));
+    defer grid_ref_tracked_c.tracked_grid_ref_free(measured_tracked);
+    const measured_start = measured.alloc_index;
+    try testing.expectEqual(Result.success, resize(measured_t, 5, 4, 0, 0));
+    const resize_allocations = measured.alloc_index - measured_start;
+    try testing.expect(resize_allocations > 2);
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 4));
+    defer free(t);
+    t.?.stream.handler.terminal.setScrollbackMaxBytes(null);
+    vt_write(t, feed.items.ptr, feed.items.len);
+    const native = t.?.stream.handler.terminal;
+    const primary = native.screens.get(.primary).?;
+    const before = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(before);
+
+    _ = primary.pages.compress(.full);
+    var compressed_node = primary.pages.pages.first.?;
+    var history_y: usize = 0;
+    while (compressed_node.storage() != .compressed) {
+        history_y += compressed_node.rows();
+        compressed_node = compressed_node.next orelse return error.NoCompressedHistory;
+    }
+    var tracked: grid_ref_tracked_c.CTrackedGridRef = null;
+    try testing.expectEqual(Result.success, grid_ref_track(t, .{
+        .tag = .history,
+        .value = .{ .history = .{ .x = 0, .y = @intCast(history_y) } },
+    }, &tracked));
+    defer grid_ref_tracked_c.tracked_grid_ref_free(tracked);
+    const before_stats = primary.pages.memoryStats();
+    const before_activity = native.compressionActivity();
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, compressed_node.storage());
+    try testing.expect(grid_ref_tracked_c.tracked_grid_ref_has_value(tracked));
+
+    const start = failing.alloc_index;
+    failing.fail_index = start + resize_allocations - 2;
+    try testing.expectEqual(Result.out_of_memory, resize(t, 5, 4, 0, 0));
+    try testing.expect(failing.has_induced_failure);
+
+    // Check storage and activity before reading cell contents: those reads may
+    // legitimately restore a compressed page, but the failed resize itself
+    // must not have done so.
+    try testing.expectEqual(before_stats, primary.pages.memoryStats());
+    try testing.expectEqual(before_activity, native.compressionActivity());
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, compressed_node.storage());
+    try testing.expect(grid_ref_tracked_c.tracked_grid_ref_has_value(tracked));
+    var snapshot: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(
+        Result.success,
+        grid_ref_tracked_c.tracked_grid_ref_snapshot(tracked, &snapshot),
+    );
+    try testing.expectEqual(compressed_node, snapshot.node);
+    var cell: cell_c.CCell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&snapshot, &cell));
+    var codepoint: u32 = 0;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .codepoint, @ptrCast(&codepoint)));
+    try testing.expectEqual(@as(u32, 'h'), codepoint);
+
+    const after = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
 test "C 8,000-row width resize remains usable after allocator failure" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var zig_alloc = failing.allocator();

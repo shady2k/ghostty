@@ -1177,7 +1177,9 @@ pub fn clone(
         page_list.append(node);
 
         const dst_page = node.page();
-        const src_page = chunk.node.page();
+        var preserved_src_page = try chunk.node.pagePreservingState(pool.alloc);
+        defer preserved_src_page.deinit();
+        const src_page = preserved_src_page.page();
         assert(node.capacity().rows >= chunk.end - chunk.start);
         defer dst_page.assertIntegrity();
         dst_page.size.rows = chunk.end - chunk.start;
@@ -1583,12 +1585,15 @@ fn resizeCols(
         .{ .screen = .{} },
         null,
     );
+    // Track source ownership separately from the iterator. RowIterator.next
+    // advances its chunk before returning the final row, but the source node
+    // remains ours until that row has reflowed successfully.
+    var remaining_source_node: ?*Node = if (it.chunk) |chunk| chunk.node else null;
     errdefer {
         // If an error occurs, we're in a pretty disastrous broken state,
-        // but we should still try to clean up our leaked memory. Free
-        // any of the remaining orphaned pages from before. If we reflowed
-        // successfully this will be null.
-        var node_: ?*Node = if (it.chunk) |chunk| chunk.node else null;
+        // but we should still try to clean up our leaked memory. Free every
+        // source node whose ownership has not yet been consumed by reflow.
+        var node_ = remaining_source_node;
         while (node_) |node| {
             node_ = node.next;
             self.destroyNode(node);
@@ -1612,6 +1617,7 @@ fn resizeCols(
     {
         var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
         while (it.next()) |row| {
+            remaining_source_node = row.node;
             try reflow_cursor.reflowRow(
                 self,
                 row,
@@ -1624,6 +1630,10 @@ fn resizeCols(
             // likely in memory constrained environments that the next
             // reflow will work.
             if (row.y == row.node.rows() - 1) destroy_node: {
+                // The source node is now either destroyed or owned by
+                // recycle_node. Keep error cleanup pointed only at the
+                // source nodes that remain unprocessed.
+                remaining_source_node = if (it.chunk) |chunk| chunk.node else null;
                 if (self.recycle_node != null or
                     row.node.owned != .pool or
                     row.node.data != .resident)
@@ -9470,13 +9480,16 @@ test "PageList compression restores through page access" {
     try testing.expect(!node.isCompressed());
     try testing.expectEqualSlices(u8, expected, node.page().memory);
 
-    // Read-only PageList operations restore through the same boundary.
+    // PageList.clone reads cold source data without restoring the original.
     try testing.expect(s.compressPage(node));
+    const before_clone_stats = s.memoryStats();
+    const before_clone_activity = s.page_compression.activity_serial;
     var cloned = try s.clone(alloc, .{
         .top = .{ .screen = .{} },
     });
     defer cloned.deinit();
-    try testing.expect(!node.isCompressed());
+    try testing.expect(node.isCompressed());
+    try testing.expectEqual(before_clone_stats, s.memoryStats());
     try testing.expectEqual(
         @as(u21, 'X'),
         cloned.pages.first.?.page().getRowAndCell(3, 2).cell.content.codepoint.data,
@@ -15006,6 +15019,73 @@ test "PageList clone full dirty" {
     try testing.expect(s2.isDirty(.{ .active = .{ .x = 0, .y = 12 } }));
     try testing.expect(!s2.isDirty(.{ .active = .{ .x = 0, .y = 14 } }));
     try testing.expect(s2.isDirty(.{ .active = .{ .x = 0, .y = 23 } }));
+}
+
+test "PageList width reflow releases heap source when final-row allocation fails" {
+    const testing = std.testing;
+    const cols = std.math.maxInt(size.CellCountInt);
+
+    // Build a single heap-owned source row without the normal initial-capacity
+    // expansion. Shrinking it to five columns creates enough destination rows
+    // to require late page allocation, while RowIterator advances to null as
+    // it returns this one (final) source row.
+    var successful_alloc = testing.FailingAllocator.init(testing.allocator, .{});
+    var resize_allocations: usize = 0;
+    {
+        var builder = try Builder.init(successful_alloc.allocator(), .{
+            .cols = cols,
+            .rows = 1,
+            .max_size = 0,
+        });
+        defer builder.deinit();
+        const page = try builder.allocatePage(.{ .cols = cols, .rows = 1 });
+        page.size = .{ .cols = cols, .rows = 1 };
+        page.getRowAndCell(cols - 1, 0).cell.* = .init('X');
+        var s = try builder.finish();
+        defer s.deinit();
+        try testing.expectEqual(Node.Owned.heap, s.pages.first.?.owned);
+
+        const start = successful_alloc.alloc_index;
+        try s.resize(.{ .cols = 5, .reflow = true });
+        resize_allocations = successful_alloc.alloc_index - start;
+        try testing.expect(s.totalRows() > 1);
+    }
+    try testing.expect(resize_allocations > 0);
+
+    for ([_]usize{ 1, 2 }) |fail_from_end| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var builder = try Builder.init(failing.allocator(), .{
+            .cols = cols,
+            .rows = 1,
+            .max_size = 0,
+        });
+        defer builder.deinit();
+        const page = try builder.allocatePage(.{ .cols = cols, .rows = 1 });
+        page.size = .{ .cols = cols, .rows = 1 };
+        page.getRowAndCell(cols - 1, 0).cell.* = .init('X');
+        var s = try builder.finish();
+        defer s.deinit();
+        const source = s.pages.first.?;
+        try testing.expectEqual(Node.Owned.heap, source.owned);
+
+        const start = failing.alloc_index;
+        failing.fail_index = start + resize_allocations - fail_from_end;
+        try testing.expectError(
+            error.OutOfMemory,
+            s.resize(.{ .cols = 5, .reflow = true }),
+        );
+        try testing.expect(failing.has_induced_failure);
+
+        // The transaction failed without changing the original source geometry
+        // or content. Its source page must also be reclaimed by the failed
+        // shadow resize even though the iterator advanced to null.
+        try testing.expectEqual(cols, s.cols);
+        try testing.expectEqual(@as(usize, 1), s.totalRows());
+        try testing.expectEqual(
+            @as(u21, 'X'),
+            source.page().getRowAndCell(cols - 1, 0).cell.codepoint(),
+        );
+    }
 }
 
 test "PageList resize (no reflow) more rows" {
