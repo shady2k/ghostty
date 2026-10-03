@@ -1982,7 +1982,12 @@ pub const Capacity = struct {
             //   - The row metadata itself
             //   - The cells per row (n=cols)
             const bytes_per_row: usize = @sizeOf(Row) + @sizeOf(Cell) * @as(usize, @intCast(cols));
-            var new_rows: usize = @divFloor(available, bytes_per_row);
+            // Capacity rows are stored as CellCountInt, so keep the
+            // candidate representable before assigning it below.
+            var new_rows: usize = @min(
+                @divFloor(available, bytes_per_row),
+                @as(usize, std.math.maxInt(size.CellCountInt)),
+            );
 
             // The cell array is aligned to a cache line, so the padding
             // between the row headers and the cells depends on the row
@@ -2852,6 +2857,20 @@ test "Page capacity adjust cols sweep" {
         const bigger_size = Page.layout(bigger).total_size;
         try testing.expect(bigger_size > original_size);
     }
+}
+
+test "Page capacity adjust cols down clamps rows to CellCountInt" {
+    // This is the same oversized capacity shape used by a valid wide C
+    // terminal, but does not allocate the page's backing memory.
+    const original: Capacity = .{
+        .cols = std.math.maxInt(size.CellCountInt),
+        .rows = std_capacity.rows,
+    };
+    const original_size = Page.layout(original).total_size;
+    const adjusted = try original.adjust(.{ .cols = 1 });
+
+    try testing.expectEqual(std.math.maxInt(size.CellCountInt), adjusted.rows);
+    try testing.expect(Page.layout(adjusted).total_size <= original_size);
 }
 
 test "Page capacity adjust cols too high" {

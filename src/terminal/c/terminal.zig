@@ -2748,6 +2748,39 @@ test "resize" {
     try testing.expectEqual(12, t.?.terminal.rows);
 }
 
+test "resize wide terminal to narrow width keeps page capacity representable" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        46498,
+        1,
+    ));
+    defer free(t);
+
+    const expected = [_]u32{ 'A', 'B', 'C' };
+    vt_write(t, "ABC", 3);
+    try testing.expectEqual(Result.success, resize(t, 1, 1, 1, 1));
+
+    // Read through the public grid-reference and cell APIs. Screen-space
+    // rows include scrollback, so all reflowed content must remain ordered.
+    for (expected, 0..) |codepoint, y| {
+        var ref: grid_ref_c.CGridRef = .{};
+        try testing.expectEqual(Result.success, grid_ref(t, .{
+            .tag = .screen,
+            .value = .{ .screen = .{ .x = 0, .y = @intCast(y) } },
+        }, &ref));
+
+        var cell: cell_c.CCell = undefined;
+        try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&ref, &cell));
+        var actual: u32 = 0;
+        try testing.expectEqual(Result.success, cell_c.get(cell, .codepoint, @ptrCast(&actual)));
+        try testing.expectEqual(codepoint, actual);
+    }
+    try testing.expectEqual(1, t.?.terminal.cols);
+    try testing.expectEqual(1, t.?.terminal.rows);
+}
+
 test "resize null" {
     try testing.expectEqual(Result.invalid_value, resize(null, 80, 24, 9, 18));
 }

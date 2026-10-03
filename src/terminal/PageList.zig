@@ -1997,7 +1997,15 @@ const ReflowCursor = struct {
             cap.cols = self.page.size.cols;
             // We're already a non-standard page. We don't want to
             // inherit a massive set of rows, so cap it at our std size.
-            cap.rows = @min(src_page.size.rows, std_capacity.rows);
+            // Keep the candidate within CellCountInt before assigning it.
+            const fallback_rows: usize = @min(
+                @as(usize, src_page.size.rows),
+                @as(usize, std_capacity.rows),
+            );
+            cap.rows = @intCast(@min(
+                fallback_rows,
+                @as(usize, std.math.maxInt(size.CellCountInt)),
+            ));
             break :err cap;
         };
 
