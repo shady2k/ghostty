@@ -1,0 +1,72 @@
+# The fork supplies nocx's pinned six-target static VT archives. This workflow
+# exists only on a build branch; the fork's main stays a fast-forward of upstream.
+# The source build is the unmodified upstream parent of this workflow commit.
+name: Build nocx libghostty-vt archives
+
+on:
+  push:
+    branches:
+      - nocx/build-libghostty-vt-*
+
+permissions:
+  contents: read
+
+jobs:
+  archives:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the fork's build branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ghostty
+          fetch-depth: 2 # the upstream source commit is this build branch's parent
+          persist-credentials: false
+      - name: Check out pinned nocx packaging tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: shady2k/nocx
+          ref: 66517eea4a4e20e3a538ab98414dd4c5675a1731
+          path: nocx
+          persist-credentials: false
+      - name: Install Go from nocx's go.mod
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: nocx/go.mod
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Build from unmodified upstream and record the hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The branch adds this workflow only; its parent is the pristine
+          # upstream commit, not a cherry-pick of the old behavioral fork.
+          cd ghostty
+          source_commit="$(git rev-parse HEAD^)"
+          git checkout --detach "$source_commit"
+          test "$(git rev-parse HEAD)" = "$source_commit"
+          cd ../nocx
+          tag="libghostty-vt-${source_commit:0:12}"
+          manifest=third_party/libghostty-vt/MANIFEST.json
+          jq --arg commit "$source_commit" --arg tag "$tag" \
+            '.upstream.repository = "https://github.com/shady2k/ghostty" |
+             .upstream.commit = $commit | .upstream.baseCommit = $commit |
+             .upstream.patch = "" | .release.tag = $tag |
+             .release.assetURLTemplate = ("https://github.com/shady2k/ghostty/releases/download/" + $tag + "/{asset}")' \
+            "$manifest" > "$manifest.tmp"
+          mv "$manifest.tmp" "$manifest"
+          nix shell nixpkgs#zig nixpkgs#llvmPackages_21.llvm --command \
+            third_party/libghostty-vt/scripts/recipe.sh \
+              --source "$GITHUB_WORKSPACE/ghostty" --update-manifest
+          go run ./cmd/vtfetch verify --manifest "$manifest" \
+            --dist build/libghostty-vt/dist
+          echo "pin=$source_commit tag=$tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload all six verified archives, headers, licenses and manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libghostty-vt-six-target-pin
+          path: |
+            nocx/build/libghostty-vt/dist/*
+            nocx/third_party/libghostty-vt/MANIFEST.json
+          if-no-files-found: error
+          retention-days: 14
