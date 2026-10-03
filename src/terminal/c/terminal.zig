@@ -2748,6 +2748,29 @@ test "resize" {
     try testing.expectEqual(12, t.?.terminal.rows);
 }
 
+test "resize wide terminal to narrow width keeps page capacity representable" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        46498,
+        1,
+    ));
+    defer free(t);
+
+    vt_write(t, "A", 1);
+    const before = try t.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(before);
+    try testing.expectEqualStrings("A", before);
+    try testing.expectEqual(Result.success, resize(t, 1, 1, 1, 1));
+    scroll_viewport(t, .{ .tag = .top, .value = undefined });
+    const visible = try t.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(visible);
+    try testing.expectEqualStrings("A", visible);
+    try testing.expectEqual(1, t.?.terminal.cols);
+    try testing.expectEqual(1, t.?.terminal.rows);
+}
+
 test "resize null" {
     try testing.expectEqual(Result.invalid_value, resize(null, 80, 24, 9, 18));
 }
