@@ -906,20 +906,25 @@ pub const Page = struct {
             break :copy copy;
         };
 
-        // If we have no managed memory in the source, then we can just
-        // copy it directly.
-        if (!src_row.managedMemory()) {
-            // This is an integrity check: if the row claims it doesn't
-            // have managed memory then all cells must also not have
-            // managed memory.
-            if (build_options.slow_runtime_safety) {
-                for (other_cells) |cell| {
-                    assert(!cell.hasGrapheme());
-                    assert(!cell.hyperlink);
-                    assert(cell.style_id == stylepkg.default_id);
+        // The row flags are a fast-path hint, but cloning is a boundary
+        // where a false negative must not copy page-local IDs without their
+        // backing data. Verify cells when the flags claim this row is plain.
+        var source_has_managed_memory = src_row.managedMemory();
+        if (!source_has_managed_memory) {
+            for (other_cells) |cell| {
+                if (cell.hasGrapheme() or
+                    cell.hyperlink or
+                    cell.style_id != stylepkg.default_id)
+                {
+                    source_has_managed_memory = true;
+                    break;
                 }
             }
+        }
 
+        // If we have no managed memory in the source, then we can just
+        // copy it directly.
+        if (!source_has_managed_memory) {
             fastmem.copy(Cell, cells, other_cells);
         } else {
             // We have managed memory, so we have to do a slower copy to
