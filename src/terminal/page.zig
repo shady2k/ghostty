@@ -906,20 +906,25 @@ pub const Page = struct {
             break :copy copy;
         };
 
-        // If we have no managed memory in the source, then we can just
-        // copy it directly.
-        if (!src_row.managedMemory()) {
-            // This is an integrity check: if the row claims it doesn't
-            // have managed memory then all cells must also not have
-            // managed memory.
-            if (build_options.slow_runtime_safety) {
-                for (other_cells) |cell| {
-                    assert(!cell.hasGrapheme());
-                    assert(!cell.hyperlink);
-                    assert(cell.style_id == stylepkg.default_id);
+        // The row flags are a fast-path hint, but cloning is a boundary
+        // where a false negative must not copy page-local IDs without their
+        // backing data. Verify cells when the flags claim this row is plain.
+        var source_has_managed_memory = src_row.managedMemory();
+        if (!source_has_managed_memory) {
+            for (other_cells) |cell| {
+                if (cell.hasGrapheme() or
+                    cell.hyperlink or
+                    cell.style_id != stylepkg.default_id)
+                {
+                    source_has_managed_memory = true;
+                    break;
                 }
             }
+        }
 
+        // If we have no managed memory in the source, then we can just
+        // copy it directly.
+        if (!source_has_managed_memory) {
             fastmem.copy(Cell, cells, other_cells);
         } else {
             // We have managed memory, so we have to do a slower copy to
@@ -3190,6 +3195,41 @@ test "Page clone styles" {
             .bold = true,
         } }).eql(style.*));
     }
+}
+
+test "Page cloneFrom repairs a stale styled marker for nondefault cells" {
+    var source = try Page.init(.{
+        .cols = 10,
+        .rows = 1,
+        .styles = 8,
+    });
+    defer source.deinit();
+
+    const style_id = try source.styles.add(source.memory, .{ .flags = .{ .bold = true } });
+    const src = source.getRowAndCell(0, 0);
+    src.row.styled = true;
+    src.cell.* = .init('S');
+    src.cell.style_id = style_id;
+    source.styles.use(source.memory, style_id);
+
+    // Synthetic stale marker: the row metadata says plain, but the cell still
+    // owns a nondefault style. Clone must derive the destination marker from
+    // rendered cell data instead of trusting this metadata bit.
+    src.row.styled = false;
+
+    var destination = try Page.init(.{
+        .cols = 10,
+        .rows = 1,
+        .styles = 8,
+    });
+    defer destination.deinit();
+    try destination.cloneFrom(&source, 0, 1);
+
+    const dst = destination.getRowAndCell(0, 0);
+    try testing.expectEqual(style_id, dst.cell.style_id);
+    try testing.expect(dst.row.styled);
+    const cloned_style = destination.styles.get(destination.memory, style_id);
+    try testing.expect((Style{ .flags = .{ .bold = true } }).eql(cloned_style.*));
 }
 
 test "Page cloneFrom" {

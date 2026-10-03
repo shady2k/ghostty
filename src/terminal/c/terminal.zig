@@ -6599,6 +6599,24 @@ fn drainDepartureText(
     return lines.toOwnedSlice(alloc);
 }
 
+fn expectTrackedPinIdentity(
+    pages: *const PageList,
+    expected: []const *PageList.Pin,
+) !void {
+    const actual = pages.trackedPins();
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected) |wanted| {
+        var found = false;
+        for (actual) |got| {
+            if (got == wanted) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
 test "alt-screen output emits nothing into the departure journal" {
     // DONE WHEN (d): the alternate screen has no history of its own and
     // departs nothing. Its scrolling - in-place, because the alternate
@@ -6849,6 +6867,55 @@ test "hidden primary shrink stages before zero-retention erase" {
     }
 }
 
+test "C width and row shrink capture rows before reflow" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        24,
+    ));
+    defer free(t);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..50) |i| {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>2}", .{i});
+        try feed.appendSlice(testing.allocator, line);
+        if (i < 49) try feed.appendSlice(testing.allocator, "\r\n");
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+
+    const initial = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (initial) |line| testing.allocator.free(line);
+        testing.allocator.free(initial);
+    }
+    try testing.expectEqual(@as(usize, 26), initial.len);
+
+    var before: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &before));
+    try testing.expectEqual(Result.success, resize(t, 5, 12, 0, 0));
+
+    var after: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &after));
+    try testing.expectEqual(before.odometer + 12, after.odometer);
+    try testing.expectEqual(@as(usize, 12), after.pending);
+
+    const captured = try drainDepartureText(t, testing.allocator);
+    defer {
+        for (captured) |line| testing.allocator.free(line);
+        testing.allocator.free(captured);
+    }
+    try testing.expectEqual(@as(usize, 12), captured.len);
+    for (captured, 26..) |line, row| {
+        var expected_buf: [16]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "row-{d:0>2}", .{row});
+        try testing.expectEqualStrings(expected, line);
+    }
+}
+
 test "a shrink while the alternate screen holds the pane emits once" {
     // DONE WHEN (c): a shrink resizes the hidden primary screen too, and
     // the rows it pushes out of the primary active area cross the top of
@@ -7036,6 +7103,269 @@ test "a scroll then a full reset in one write keeps the departed rows" {
     // The first departed rows are the first printed ones: the journal is
     // oldest-first, and the reset did not reorder or erase it.
     try testing.expectEqualStrings("reset-00", lines[0]);
+}
+
+test "C width reflow preserves rendered style and wide cells on OOM and success" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 4));
+    defer free(t);
+
+    const input = "\x1b[1;31mR界\x1b[0m";
+    vt_write(t, input.ptr, input.len);
+
+    const c_point: point.Point.C = .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 0, .y = 0 } },
+    };
+    var original_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, c_point, &original_ref));
+
+    // Fail the first allocation in the C width resize. The caller's existing
+    // grid ref remains valid and still exposes the rendered style and wide
+    // flags, not only the same text snapshot.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(Result.out_of_memory, resize(t, 5, 4, 0, 0));
+    var after_failure_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, c_point, &after_failure_ref));
+    try testing.expectEqual(original_ref.node, after_failure_ref.node);
+    var cell: cell_c.CCell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&original_ref, &cell));
+    var codepoint: u32 = 0;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .codepoint, @ptrCast(&codepoint)));
+    try testing.expectEqual(@as(u32, 'R'), codepoint);
+    var styled: bool = false;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .has_styling, @ptrCast(&styled)));
+    try testing.expect(styled);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, resize(t, 5, 4, 0, 0));
+
+    const expected = [_]struct {
+        x: size.CellCountInt,
+        codepoint: u32,
+        wide: cell_c.Wide,
+    }{
+        .{ .x = 0, .codepoint = 'R', .wide = .narrow },
+        .{ .x = 1, .codepoint = '界', .wide = .wide },
+        .{ .x = 2, .codepoint = 0, .wide = .spacer_tail },
+    };
+    for (expected) |want| {
+        var ref: grid_ref_c.CGridRef = .{};
+        try testing.expectEqual(Result.success, grid_ref(t, .{
+            .tag = .active,
+            .value = .{ .active = .{ .x = want.x, .y = 0 } },
+        }, &ref));
+        var rendered: cell_c.CCell = undefined;
+        try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&ref, &rendered));
+        var got_codepoint: u32 = 0;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .codepoint,
+            @ptrCast(&got_codepoint),
+        ));
+        try testing.expectEqual(want.codepoint, got_codepoint);
+        var got_wide: cell_c.Wide = .narrow;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .wide,
+            @ptrCast(&got_wide),
+        ));
+        try testing.expectEqual(want.wide, got_wide);
+        var got_styled: bool = false;
+        try testing.expectEqual(Result.success, cell_c.get(
+            rendered,
+            .has_styling,
+            @ptrCast(&got_styled),
+        ));
+        try testing.expect(got_styled);
+    }
+}
+
+test "C failed width resize preserves cold compressed history state" {
+    const lines: usize = 10_000;
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..lines) |i| {
+        var line_buf: [24]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "history-{d:0>4}\r\n", .{i});
+        try feed.appendSlice(testing.allocator, line);
+    }
+
+    // First run a successful resize on an identical terminal to place the
+    // injected OOM at the last destination-page allocation in the failure run,
+    // after clone has inspected the cold compressed source page.
+    var measured = testing.FailingAllocator.init(testing.allocator, .{});
+    var measured_zig_alloc = measured.allocator();
+    const measured_c_alloc = lib.alloc.Allocator.fromZig(&measured_zig_alloc);
+    var measured_t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&measured_c_alloc, &measured_t, 10, 4));
+    defer free(measured_t);
+    measured_t.?.stream.handler.terminal.setScrollbackMaxBytes(null);
+    vt_write(measured_t, feed.items.ptr, feed.items.len);
+    const measured_native = measured_t.?.stream.handler.terminal;
+    const measured_primary = measured_native.screens.get(.primary).?;
+    _ = measured_primary.pages.compress(.full);
+    var measured_compressed_node = measured_primary.pages.pages.first.?;
+    var measured_history_y: usize = 0;
+    while (measured_compressed_node.storage() != .compressed) {
+        measured_history_y += measured_compressed_node.rows();
+        measured_compressed_node = measured_compressed_node.next orelse
+            return error.NoCompressedHistory;
+    }
+    var measured_tracked: grid_ref_tracked_c.CTrackedGridRef = null;
+    try testing.expectEqual(Result.success, grid_ref_track(measured_t, .{
+        .tag = .history,
+        .value = .{ .history = .{ .x = 0, .y = @intCast(measured_history_y) } },
+    }, &measured_tracked));
+    defer grid_ref_tracked_c.tracked_grid_ref_free(measured_tracked);
+    const measured_start = measured.alloc_index;
+    try testing.expectEqual(Result.success, resize(measured_t, 5, 4, 0, 0));
+    const resize_allocations = measured.alloc_index - measured_start;
+    try testing.expect(resize_allocations > 2);
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 4));
+    defer free(t);
+    t.?.stream.handler.terminal.setScrollbackMaxBytes(null);
+    vt_write(t, feed.items.ptr, feed.items.len);
+    const native = t.?.stream.handler.terminal;
+    const primary = native.screens.get(.primary).?;
+    const before = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(before);
+
+    _ = primary.pages.compress(.full);
+    var compressed_node = primary.pages.pages.first.?;
+    var history_y: usize = 0;
+    while (compressed_node.storage() != .compressed) {
+        history_y += compressed_node.rows();
+        compressed_node = compressed_node.next orelse return error.NoCompressedHistory;
+    }
+    var tracked: grid_ref_tracked_c.CTrackedGridRef = null;
+    try testing.expectEqual(Result.success, grid_ref_track(t, .{
+        .tag = .history,
+        .value = .{ .history = .{ .x = 0, .y = @intCast(history_y) } },
+    }, &tracked));
+    defer grid_ref_tracked_c.tracked_grid_ref_free(tracked);
+    const before_stats = primary.pages.memoryStats();
+    const before_activity = native.compressionActivity();
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, compressed_node.storage());
+    try testing.expect(grid_ref_tracked_c.tracked_grid_ref_has_value(tracked));
+
+    const start = failing.alloc_index;
+    failing.fail_index = start + resize_allocations - 2;
+    try testing.expectEqual(Result.out_of_memory, resize(t, 5, 4, 0, 0));
+    try testing.expect(failing.has_induced_failure);
+
+    // Check storage and activity before reading cell contents: those reads may
+    // legitimately restore a compressed page, but the failed resize itself
+    // must not have done so.
+    try testing.expectEqual(before_stats, primary.pages.memoryStats());
+    try testing.expectEqual(before_activity, native.compressionActivity());
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, compressed_node.storage());
+    try testing.expect(grid_ref_tracked_c.tracked_grid_ref_has_value(tracked));
+    var snapshot: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(
+        Result.success,
+        grid_ref_tracked_c.tracked_grid_ref_snapshot(tracked, &snapshot),
+    );
+    try testing.expectEqual(compressed_node, snapshot.node);
+    var cell: cell_c.CCell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&snapshot, &cell));
+    var codepoint: u32 = 0;
+    try testing.expectEqual(Result.success, cell_c.get(cell, .codepoint, @ptrCast(&codepoint)));
+    try testing.expectEqual(@as(u32, 'h'), codepoint);
+
+    const after = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "C 8,000-row width resize remains usable after allocator failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 24));
+    defer free(t);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..8_000) |i| {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>5}\r\n", .{i});
+        try feed.appendSlice(testing.allocator, line);
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+    const styled_wide = "\x1b[1;31m界wide\x1b[0m\r\n";
+    vt_write(t, styled_wide.ptr, styled_wide.len);
+
+    const wrapper = t.?;
+    const native = wrapper.stream.handler.terminal;
+    const primary = native.screens.get(.primary).?;
+    const before = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(before);
+    const before_total_rows = primary.pages.total_rows;
+    var before_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &before_status));
+    var stable_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &stable_status));
+
+    // The first failed resize allocation must return through the C API, not
+    // trip PageList's debug integrity assertion.
+    failing.fail_index = failing.alloc_index + 1;
+    try testing.expectEqual(Result.out_of_memory, resize(t, 5, 24, 0, 0));
+    try testing.expectEqual(@as(usize, 10), native.cols);
+    try testing.expectEqual(@as(usize, 24), native.rows);
+    try testing.expectEqual(before_total_rows, primary.pages.total_rows);
+    const after_failure = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(after_failure);
+    try testing.expectEqualStrings(before, after_failure);
+
+    var after_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &after_status));
+    try testing.expectEqual(stable_status.odometer, after_status.odometer);
+    try testing.expectEqual(stable_status.pending, after_status.pending);
+    try testing.expectEqual(stable_status.staged_bytes, after_status.staged_bytes);
+    try testing.expectEqual(stable_status.peak_bytes, after_status.peak_bytes);
+    try testing.expectEqual(stable_status.refused_rows, after_status.refused_rows);
+    try testing.expectEqual(stable_status.refused_from, after_status.refused_from);
+
+    failing.fail_index = std.math.maxInt(usize);
+    vt_write(t, "post-failure\r\n", "post-failure\r\n".len);
+    try testing.expectEqual(Result.success, resize(t, 5, 24, 0, 0));
+    const after_resize = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(after_resize);
+    var previous: usize = 0;
+    for (0..8_000) |i| {
+        var line_buf: [12]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>5}", .{i});
+        const found = std.mem.indexOfPos(u8, after_resize, previous, line) orelse
+            return error.ResizedRowsMissingOrOutOfOrder;
+        previous = found + line.len;
+    }
+    try testing.expect(std.mem.indexOf(u8, after_resize, "post-failure") != null);
+    try testing.expect(std.mem.indexOf(u8, after_resize, "界wide") != null);
 }
 
 test "styled and clustered rows round-trip through the drain" {
@@ -7255,4 +7585,162 @@ test "a scroll clear journals the rows it pushes into history" {
     const expected = [_][]const u8{ "sc-1", "sc-2", "sc-3", "sc-4", "sc-5", "sc-6" };
     try testing.expectEqual(expected.len, lines.len);
     for (lines, expected) |line, want| try testing.expectEqualStrings(want, line);
+}
+
+test "C width resize fails cleanly at every allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var zig_alloc = failing.allocator();
+    const c_alloc = lib.alloc.Allocator.fromZig(&zig_alloc);
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&c_alloc, &t, 10, 24));
+    defer free(t);
+
+    var feed: std.ArrayList(u8) = .empty;
+    defer feed.deinit(testing.allocator);
+    for (0..128) |i| {
+        var line_buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>5}\r\n", .{i});
+        try feed.appendSlice(testing.allocator, line);
+    }
+    vt_write(t, feed.items.ptr, feed.items.len);
+    const styled_wide = "\x1b[1;31m界wide\x1b[0m\r\n";
+    vt_write(t, styled_wide.ptr, styled_wide.len);
+
+    const wrapper = t.?;
+    const native = wrapper.stream.handler.terminal;
+    const primary = native.screens.get(.primary).?;
+    const tracked_before = try testing.allocator.dupe(
+        *PageList.Pin,
+        primary.pages.trackedPins(),
+    );
+    defer testing.allocator.free(tracked_before);
+    const tracked_count_before = primary.pages.countTrackedPins();
+    const live_pin_count_before = primary.pages.pool.pins.live_count;
+    const viewport_pin_before = primary.pages.viewport_pin;
+    var stable_viewport_pin: ?*PageList.Pin = null;
+    var stable_live_pin_count: ?usize = null;
+    var before = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(before);
+    var before_cols = native.cols;
+    var before_rows = native.rows;
+    var before_total_rows = primary.pages.total_rows;
+
+    var before_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &before_status));
+    // A second read clears the read-and-clear status fields so later reads
+    // can prove that a failed resize did not stage a departure or refusal.
+    var stable_status: DepartureStatus = undefined;
+    try testing.expectEqual(Result.success, departure_status(t, &stable_status));
+
+    // Each iteration moves the injected failure to the next allocation made
+    // by resize. Success means the previous iterations exercised every
+    // fallible allocation in the width resize.
+    var failure_offset: usize = 0;
+    while (failure_offset < 256) : (failure_offset += 1) {
+        failing.fail_index = failing.alloc_index + failure_offset;
+        const resize_result = resize(t, 5, 24, 0, 0);
+        if (resize_result == .success) break;
+        try testing.expectEqual(Result.out_of_memory, resize_result);
+        try testing.expectEqual(before_cols, native.cols);
+        try testing.expectEqual(before_rows, native.rows);
+        try testing.expectEqual(before_total_rows, primary.pages.total_rows);
+        try expectTrackedPinIdentity(&primary.pages, tracked_before);
+        try testing.expectEqual(tracked_count_before, primary.pages.countTrackedPins());
+        try testing.expectEqual(
+            stable_viewport_pin orelse viewport_pin_before,
+            primary.pages.viewport_pin,
+        );
+        try testing.expectEqual(
+            stable_live_pin_count orelse live_pin_count_before,
+            primary.pages.pool.pins.live_count,
+        );
+
+        const after = try primary.dumpStringAllocUnwrapped(
+            testing.allocator,
+            .{ .screen = .{} },
+        );
+        defer testing.allocator.free(after);
+        try testing.expectEqualStrings(before, after);
+
+        var after_status: DepartureStatus = undefined;
+        try testing.expectEqual(Result.success, departure_status(t, &after_status));
+        try testing.expectEqual(stable_status.odometer, after_status.odometer);
+        try testing.expectEqual(stable_status.pending, after_status.pending);
+        try testing.expectEqual(stable_status.staged_bytes, after_status.staged_bytes);
+        try testing.expectEqual(stable_status.peak_bytes, after_status.peak_bytes);
+        try testing.expectEqual(stable_status.refused_rows, after_status.refused_rows);
+        try testing.expectEqual(stable_status.refused_from, after_status.refused_from);
+
+        // Exercise the same C terminal after each injected failure, not only
+        // after the final allocation slot. Resize back to the original width
+        // so the next iteration starts from a coherent, usable terminal.
+        failing.fail_index = std.math.maxInt(usize);
+        vt_write(t, "after-oom\r\n", "after-oom\r\n".len);
+        const after_write = try primary.dumpStringAllocUnwrapped(
+            testing.allocator,
+            .{ .screen = .{} },
+        );
+        defer testing.allocator.free(after_write);
+        try testing.expect(std.mem.indexOf(u8, after_write, "after-oom") != null);
+        try testing.expectEqual(Result.success, resize(t, 5, 24, 0, 0));
+        if (stable_viewport_pin) |expected| {
+            try testing.expectEqual(expected, primary.pages.viewport_pin);
+        } else {
+            stable_viewport_pin = primary.pages.viewport_pin;
+            stable_live_pin_count = primary.pages.pool.pins.live_count;
+            try testing.expectEqual(live_pin_count_before + 1, stable_live_pin_count.?);
+        }
+        try testing.expectEqual(tracked_count_before, primary.pages.countTrackedPins());
+        try expectTrackedPinIdentity(&primary.pages, tracked_before);
+        try testing.expectEqual(
+            stable_live_pin_count.?,
+            primary.pages.pool.pins.live_count,
+        );
+
+        try testing.expectEqual(Result.success, resize(t, 10, 24, 0, 0));
+        try testing.expectEqual(stable_viewport_pin.?, primary.pages.viewport_pin);
+        try testing.expectEqual(tracked_count_before, primary.pages.countTrackedPins());
+        try expectTrackedPinIdentity(&primary.pages, tracked_before);
+        try testing.expectEqual(
+            stable_live_pin_count.?,
+            primary.pages.pool.pins.live_count,
+        );
+
+        testing.allocator.free(before);
+        before = try primary.dumpStringAllocUnwrapped(
+            testing.allocator,
+            .{ .screen = .{} },
+        );
+        before_cols = native.cols;
+        before_rows = native.rows;
+        before_total_rows = primary.pages.total_rows;
+        try testing.expectEqual(Result.success, departure_status(t, &stable_status));
+        try testing.expectEqual(Result.success, departure_status(t, &stable_status));
+    } else {
+        return error.ResizeFailureInjectionLimitExceeded;
+    }
+
+    // The same terminal remains live after all failures: it accepts output,
+    // and a successful resize retains the original logical rows in order.
+    failing.fail_index = std.math.maxInt(usize);
+    vt_write(t, "post-failure\r\n", "post-failure\r\n".len);
+    try testing.expectEqual(Result.success, resize(t, 5, 24, 0, 0));
+    const after_resize = try primary.dumpStringAllocUnwrapped(
+        testing.allocator,
+        .{ .screen = .{} },
+    );
+    defer testing.allocator.free(after_resize);
+    var previous: usize = 0;
+    for (0..128) |i| {
+        var line_buf: [12]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "row-{d:0>5}", .{i});
+        const found = std.mem.indexOfPos(u8, after_resize, previous, line) orelse
+            return error.ResizedRowsMissingOrOutOfOrder;
+        previous = found + line.len;
+    }
+    try testing.expect(std.mem.indexOf(u8, after_resize, "post-failure") != null);
+    try testing.expect(std.mem.indexOf(u8, after_resize, "界wide") != null);
 }

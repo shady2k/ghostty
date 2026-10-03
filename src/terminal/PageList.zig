@@ -355,7 +355,35 @@ else untouched: {
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
 const PinSet = std.AutoArrayHashMapUnmanaged(*Pin, void);
-const PinPool = std.heap.memory_pool.Managed(Pin);
+const PinPool = struct {
+    managed: std.heap.memory_pool.Managed(Pin),
+    live_count: usize = 0,
+
+    fn initCapacity(alloc: Allocator, capacity: usize) Allocator.Error!PinPool {
+        return .{ .managed = try .initCapacity(alloc, capacity) };
+    }
+
+    fn deinit(self: *PinPool) void {
+        self.managed.deinit();
+    }
+
+    fn reset(self: *PinPool, mode: std.heap.ArenaAllocator.ResetMode) bool {
+        self.live_count = 0;
+        return self.managed.reset(mode);
+    }
+
+    fn create(self: *PinPool) Allocator.Error!*Pin {
+        const allocated = try self.managed.create();
+        self.live_count += 1;
+        return allocated;
+    }
+
+    fn destroy(self: *PinPool, allocated: *Pin) void {
+        assert(self.live_count > 0);
+        self.live_count -= 1;
+        self.managed.destroy(allocated);
+    }
+};
 
 /// The pool of memory used for a pagelist. This can be shared between
 /// multiple pagelists but it is not threadsafe.
@@ -972,11 +1000,14 @@ fn releasePoolPage(pool: *MemoryPool, page: *const Page) void {
 pub fn deinit(self: *PageList) void {
     // Verify integrity before cleanup
     self.assertIntegrity();
+    self.deinitUnverified();
+}
 
-    // Always deallocate our hashmap.
+/// Release storage without checking list integrity. Used only to discard a
+/// transaction's partially reflowed destination after an allocation failure,
+/// or during the final ownership handoff of a successful transaction.
+fn deinitUnverified(self: *PageList) void {
     self.tracked_pins.deinit(self.pool.alloc);
-
-    // Release every page and node back to the pools, then free the pools.
     releasePages(&self.pool, self.pages);
     self.pool.deinit();
 }
@@ -1146,7 +1177,9 @@ pub fn clone(
         page_list.append(node);
 
         const dst_page = node.page();
-        const src_page = chunk.node.page();
+        var preserved_src_page = try chunk.node.pagePreservingState(pool.alloc);
+        defer preserved_src_page.deinit();
+        const src_page = preserved_src_page.page();
         assert(node.capacity().rows >= chunk.end - chunk.start);
         defer dst_page.assertIntegrity();
         dst_page.size.rows = chunk.end - chunk.start;
@@ -1269,7 +1302,108 @@ fn resizeWithoutReflowAndCapture(
 }
 
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
-    defer self.assertIntegrity();
+    const cols = opts.cols orelse self.cols;
+    if (opts.reflow and cols != self.cols and
+        (opts.rows == null or opts.rows.? == self.rows))
+    {
+        return self.resizeColsTransactional(opts);
+    }
+    return self.resizeInPlace(opts, true);
+}
+
+/// A width reflow is built on an independent copy so allocator failure cannot
+/// expose its partially rewritten page list through the live terminal.
+fn resizeColsTransactional(self: *PageList, opts: Resize) Allocator.Error!void {
+    var pin_remap: Clone.TrackedPinsRemap = .init(self.pool.alloc);
+    defer pin_remap.deinit();
+
+    // The viewport pin is not part of tracked_pins. Temporarily register its
+    // value so clone can preserve a scrolled-back viewport as well.
+    const viewport_pin: ?*Pin = if (self.viewport == .pin)
+        try self.trackPin(self.viewport_pin.*)
+    else
+        null;
+    defer if (viewport_pin) |p| self.untrackPin(p);
+
+    var resized = self.clone(self.pool.alloc, .{
+        .top = .{ .screen = .{} },
+        .tracked_pins = &pin_remap,
+    }) catch return error.OutOfMemory;
+    errdefer resized.deinitUnverified();
+
+    // Clone starts its viewport at the top; restore the original viewport
+    // against the corresponding pin in the cloned page list.
+    resized.viewport = self.viewport;
+    resized.viewport_pin_row_offset = self.viewport_pin_row_offset;
+    if (viewport_pin) |old| {
+        const cloned = pin_remap.get(old) orelse return error.OutOfMemory;
+        resized.viewport_pin.* = cloned.*;
+        _ = pin_remap.remove(old);
+        resized.untrackPin(cloned);
+    }
+
+    resized.departures = self.departures;
+    resized.page_serial_epoch = self.page_serial_epoch;
+    // Give cloned pages fresh serials so a pre-resize page reference cannot
+    // become valid again merely because its coordinates happen to match.
+    var next_serial = self.page_serial;
+    var page_node = resized.pages.first;
+    while (page_node) |node| : (page_node = node.next) {
+        node.serial = next_serial;
+        next_serial += 1;
+    }
+    resized.page_serial = next_serial;
+
+    var resized_opts = opts;
+    if (resized_opts.cursor) |*cursor| {
+        if (cursor.pin) |old| {
+            cursor.pin = pin_remap.get(old) orelse return error.OutOfMemory;
+        }
+    }
+
+    try resized.resizeInPlace(resized_opts, false);
+
+    // Keep an untracked viewport pin in place across transactions. When the
+    // old viewport pin is a stable tracked identity, allocate a replacement
+    // from the live pool before commit; this is the last fallible operation.
+    const reuse_viewport_pin = !self.tracked_pins.contains(self.viewport_pin);
+    const replacement_viewport_pin = if (reuse_viewport_pin)
+        self.viewport_pin
+    else
+        try self.pool.pins.create();
+    errdefer if (!reuse_viewport_pin) self.pool.pins.destroy(replacement_viewport_pin);
+    replacement_viewport_pin.* = resized.viewport_pin.*;
+
+    // Keep existing Pin addresses stable for Screen, selections and C grid
+    // references. Their new values point into the completed cloned list.
+    var remap_it = pin_remap.iterator();
+    while (remap_it.next()) |entry| entry.key_ptr.*.* = entry.value_ptr.*.*;
+
+    // The completed list takes ownership of the old pin pool and tracked-pin
+    // set. The old list takes the temporary clone pins so its ordinary storage
+    // cleanup cannot free references now used by the replacement list.
+    const old_pin_pool = self.pool.pins;
+    self.pool.pins = resized.pool.pins;
+    resized.pool.pins = old_pin_pool;
+    const old_tracked_pins = self.tracked_pins;
+    self.tracked_pins = resized.tracked_pins;
+    resized.tracked_pins = old_tracked_pins;
+    resized.viewport_pin = replacement_viewport_pin;
+
+    // self's page content is still intact; only its pin values now target the
+    // replacement pages. Skip the integrity assertion during this ownership
+    // handoff, then replace it with the fully verified reflowed copy.
+    self.deinitUnverified();
+    self.* = resized;
+}
+
+fn resizeInPlace(
+    self: *PageList,
+    opts: Resize,
+    assert_on_error: bool,
+) Allocator.Error!void {
+    var succeeded = false;
+    defer if (succeeded or assert_on_error) self.assertIntegrity();
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -1295,6 +1429,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         // Shrinking the active row count turns former active rows into
         // scrollback even without reflow, which can cross the line limit.
         self.limits.enforce(self, .lines);
+        succeeded = true;
         return;
     }
 
@@ -1347,6 +1482,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // resize can move the active boundary. Both may expose whole old pages
     // that are now eligible for line-limit pruning.
     self.limits.enforce(self, .lines);
+    succeeded = true;
 }
 
 /// Resize the pagelist with reflow by adding or removing columns.
@@ -1449,12 +1585,15 @@ fn resizeCols(
         .{ .screen = .{} },
         null,
     );
+    // Track source ownership separately from the iterator. RowIterator.next
+    // advances its chunk before returning the final row, but the source node
+    // remains ours until that row has reflowed successfully.
+    var remaining_source_node: ?*Node = if (it.chunk) |chunk| chunk.node else null;
     errdefer {
         // If an error occurs, we're in a pretty disastrous broken state,
-        // but we should still try to clean up our leaked memory. Free
-        // any of the remaining orphaned pages from before. If we reflowed
-        // successfully this will be null.
-        var node_: ?*Node = if (it.chunk) |chunk| chunk.node else null;
+        // but we should still try to clean up our leaked memory. Free every
+        // source node whose ownership has not yet been consumed by reflow.
+        var node_ = remaining_source_node;
         while (node_) |node| {
             node_ = node.next;
             self.destroyNode(node);
@@ -1478,6 +1617,7 @@ fn resizeCols(
     {
         var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
         while (it.next()) |row| {
+            remaining_source_node = row.node;
             try reflow_cursor.reflowRow(
                 self,
                 row,
@@ -1490,6 +1630,10 @@ fn resizeCols(
             // likely in memory constrained environments that the next
             // reflow will work.
             if (row.y == row.node.rows() - 1) destroy_node: {
+                // The source node is now either destroyed or owned by
+                // recycle_node. Keep error cleanup pointed only at the
+                // source nodes that remain unprocessed.
+                remaining_source_node = if (it.chunk) |chunk| chunk.node else null;
                 if (self.recycle_node != null or
                     row.node.owned != .pool or
                     row.node.data != .resident)
@@ -9344,13 +9488,17 @@ test "PageList compression restores through page access" {
     try testing.expect(!node.isCompressed());
     try testing.expectEqualSlices(u8, expected, node.page().memory);
 
-    // Read-only PageList operations restore through the same boundary.
+    // PageList.clone reads cold source data without restoring the original.
     try testing.expect(s.compressPage(node));
+    const before_clone_stats = s.memoryStats();
+    const before_clone_activity = s.page_compression.activity_serial;
     var cloned = try s.clone(alloc, .{
         .top = .{ .screen = .{} },
     });
     defer cloned.deinit();
-    try testing.expect(!node.isCompressed());
+    try testing.expect(node.isCompressed());
+    try testing.expectEqual(before_clone_stats, s.memoryStats());
+    try testing.expectEqual(before_clone_activity, s.page_compression.activity_serial);
     try testing.expectEqual(
         @as(u21, 'X'),
         cloned.pages.first.?.page().getRowAndCell(3, 2).cell.content.codepoint.data,
@@ -14880,6 +15028,73 @@ test "PageList clone full dirty" {
     try testing.expect(s2.isDirty(.{ .active = .{ .x = 0, .y = 12 } }));
     try testing.expect(!s2.isDirty(.{ .active = .{ .x = 0, .y = 14 } }));
     try testing.expect(s2.isDirty(.{ .active = .{ .x = 0, .y = 23 } }));
+}
+
+test "PageList width reflow releases heap source when final-row allocation fails" {
+    const testing = std.testing;
+    const cols = std.math.maxInt(size.CellCountInt);
+
+    // Build a single heap-owned source row without the normal initial-capacity
+    // expansion. Shrinking it to five columns creates enough destination rows
+    // to require late page allocation, while RowIterator advances to null as
+    // it returns this one (final) source row.
+    var successful_alloc = testing.FailingAllocator.init(testing.allocator, .{});
+    var resize_allocations: usize = 0;
+    {
+        var builder = try Builder.init(successful_alloc.allocator(), .{
+            .cols = cols,
+            .rows = 1,
+            .max_size = 0,
+        });
+        defer builder.deinit();
+        const page = try builder.allocatePage(.{ .cols = cols, .rows = 1 });
+        page.size = .{ .cols = cols, .rows = 1 };
+        page.getRowAndCell(cols - 1, 0).cell.* = .init('X');
+        var s = try builder.finish();
+        defer s.deinit();
+        try testing.expectEqual(Node.Owned.heap, s.pages.first.?.owned);
+
+        const start = successful_alloc.alloc_index;
+        try s.resize(.{ .cols = 5, .reflow = true });
+        resize_allocations = successful_alloc.alloc_index - start;
+        try testing.expect(s.totalRows() > 1);
+    }
+    try testing.expect(resize_allocations > 0);
+
+    for ([_]usize{ 1, 2 }) |fail_from_end| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var builder = try Builder.init(failing.allocator(), .{
+            .cols = cols,
+            .rows = 1,
+            .max_size = 0,
+        });
+        defer builder.deinit();
+        const page = try builder.allocatePage(.{ .cols = cols, .rows = 1 });
+        page.size = .{ .cols = cols, .rows = 1 };
+        page.getRowAndCell(cols - 1, 0).cell.* = .init('X');
+        var s = try builder.finish();
+        defer s.deinit();
+        const source = s.pages.first.?;
+        try testing.expectEqual(Node.Owned.heap, source.owned);
+
+        const start = failing.alloc_index;
+        failing.fail_index = start + resize_allocations - fail_from_end;
+        try testing.expectError(
+            error.OutOfMemory,
+            s.resize(.{ .cols = 5, .reflow = true }),
+        );
+        try testing.expect(failing.has_induced_failure);
+
+        // The transaction failed without changing the original source geometry
+        // or content. Its source page must also be reclaimed by the failed
+        // shadow resize even though the iterator advanced to null.
+        try testing.expectEqual(cols, s.cols);
+        try testing.expectEqual(@as(usize, 1), s.totalRows());
+        try testing.expectEqual(
+            @as(u21, 'X'),
+            source.page().getRowAndCell(cols - 1, 0).cell.codepoint(),
+        );
+    }
 }
 
 test "PageList resize (no reflow) more rows" {
