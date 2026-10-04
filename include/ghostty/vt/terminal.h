@@ -104,6 +104,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_RENDER_HOLD`      | `GhosttyTerminalRenderHoldFn`     | Synchronized output (mode 2026) begins or ends |
  * | `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT`  | `GhosttyTerminalSemanticPromptFn` | Shell reports a prompt or command step via OSC 133 |
  * | `GHOSTTY_TERMINAL_OPT_RESET`            | `GhosttyTerminalResetFn`          | Full reset (RIS, ESC c)                   |
+ * | `GHOSTTY_TERMINAL_OPT_HISTORY_ERASED`  | `GhosttyTerminalHistoryErasedFn`  | History rows are about to be erased       |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -1270,6 +1271,34 @@ typedef struct {
 } GhosttyTerminalSemanticPrompt;
 
 /**
+ * A span of history rows that is about to be destroyed.
+ *
+ * The rows remain readable during the callback. `first_row` is the first
+ * HISTORY-coordinate row and `count` is the number of rows in the span.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+  /** HISTORY-coordinate first row being destroyed. */
+  uint32_t first_row;
+  /** Number of rows in [first_row, first_row + count). */
+  uint32_t count;
+} GhosttyTerminalHistoryErased;
+
+/**
+ * Called synchronously before history rows are erased. The span is borrowed
+ * for the callback duration; callbacks must not re-enter vt_write.
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalHistoryErasedFn)(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyTerminalHistoryErased* erased);
+
+/**
  * Callback function type for semantic_prompt.
  *
  * Called when the shell reports a step of a command. Each command goes
@@ -2145,6 +2174,11 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalResetFn
    */
   GHOSTTY_TERMINAL_OPT_RESET = 43,
+
+  /** Callback invoked synchronously before history rows are destroyed.
+   * Input type: GhosttyTerminalHistoryErasedFn
+   */
+  GHOSTTY_TERMINAL_OPT_HISTORY_ERASED = 44,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

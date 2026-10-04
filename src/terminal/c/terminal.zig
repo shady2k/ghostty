@@ -198,6 +198,15 @@ pub const SemanticPromptKind = Handler.SemanticPrompt.Kind;
 /// C: GhosttySemanticPromptPromptKind
 pub const SemanticPromptPromptKind = Handler.SemanticPrompt.PromptKind;
 
+/// Rows in history that are about to be erased.
+///
+/// C: GhosttyTerminalHistoryErased
+pub const HistoryErased = extern struct {
+    size: usize,
+    first_row: u32,
+    count: u32,
+};
+
 /// A shell integration event. See `Handler.SemanticPrompt`.
 ///
 /// C: GhosttyTerminalSemanticPrompt
@@ -282,6 +291,7 @@ const Effects = struct {
     progress_report: ?ProgressReportFn = null,
     semantic_prompt: ?SemanticPromptFn = null,
     reset: ?ResetFn = null,
+    history_erased: ?HistoryErasedFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
     clipboard_read: ?ClipboardReadFn = null,
@@ -349,6 +359,9 @@ const Effects = struct {
 
     /// C function pointer type for the reset callback.
     pub const ResetFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for history destruction notifications.
+    pub const HistoryErasedFn = *const fn (Terminal, ?*anyopaque, *const HistoryErased) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the unknown_sequence callback. The request
     /// and its content are borrowed for the callback duration.
@@ -670,6 +683,22 @@ const Effects = struct {
             .@"error" = .init(event.err),
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &c_event);
+    }
+
+    fn historyErasedPageList(
+        _: *PageList,
+        userdata: ?*anyopaque,
+        first_row: usize,
+        count: usize,
+    ) void {
+        const wrapper: *TerminalWrapper = @ptrCast(@alignCast(userdata.?));
+        const func = wrapper.effects.history_erased orelse return;
+        const erased: HistoryErased = .{
+            .size = @sizeOf(HistoryErased),
+            .first_row = @intCast(first_row),
+            .count = @intCast(count),
+        };
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &erased);
     }
 
     fn resetTrampoline(handler: *Handler) void {
@@ -1252,6 +1281,7 @@ pub const Option = enum(c_int) {
     render_hold = 41,
     semantic_prompt = 42,
     reset = 43,
+    history_erased = 44,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1274,6 +1304,7 @@ pub const Option = enum(c_int) {
             .render_hold => ?Effects.RenderHoldFn,
             .semantic_prompt => ?Effects.SemanticPromptFn,
             .reset => ?Effects.ResetFn,
+            .history_erased => ?Effects.HistoryErasedFn,
             .title, .pwd, .terminfo_name => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
@@ -1345,6 +1376,13 @@ fn setTyped(
         .render_hold => wrapper.effects.render_hold = value,
         .semantic_prompt => wrapper.effects.semantic_prompt = value,
         .reset => wrapper.effects.reset = value,
+        .history_erased => {
+            wrapper.effects.history_erased = value;
+            wrapper.terminal.setHistoryErasedCallback(
+                if (value != null) &Effects.historyErasedPageList else null,
+                if (value != null) @ptrCast(wrapper) else null,
+            );
+        },
         .clipboard_write => {
             wrapper.effects.clipboard_write = value;
             wrapper.stream.handler.effects.clipboard_write = if (value != null)
@@ -4968,6 +5006,47 @@ test "set semantic_prompt callback" {
     try testing.expectEqual(Result.success, set(t, .semantic_prompt, null));
     vt_write(t, prompt, prompt.len);
     try testing.expectEqual(@as(usize, 5), S.count);
+}
+
+test "set history_erased callback and clear it" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var first: u32 = 0;
+        var rows: u32 = 0;
+
+        fn erased(_: Terminal, _: ?*anyopaque, event: *const HistoryErased) callconv(lib.calling_conv) void {
+            count += 1;
+            first = event.first_row;
+            rows = event.count;
+        }
+    };
+    S.count = 0;
+    try testing.expectEqual(Result.success, set(t, .history_erased, @ptrCast(&S.erased)));
+    const terminal = zigTerminal(t).?;
+    var it = terminal.screens.all.iterator();
+    while (it.next()) |entry| try testing.expect(entry.value.*.pages.history_erased != null);
+
+    // Scroll enough rows to create retained history, then reset while the
+    // callback can still inspect the old page list.
+    const output = "line\r\n" ** 80;
+    vt_write(t, output, output.len);
+    vt_write(t, "\x1Bc", 3);
+    try testing.expect(S.count > 0);
+    try testing.expectEqual(@as(u32, 0), S.first);
+    try testing.expect(S.rows > 0);
+
+    try testing.expectEqual(Result.success, set(t, .history_erased, null));
+    it = terminal.screens.all.iterator();
+    while (it.next()) |entry| try testing.expect(entry.value.*.pages.history_erased == null);
 }
 
 test "set reset callback" {

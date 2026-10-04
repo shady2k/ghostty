@@ -47,6 +47,10 @@ const TABSTOP_INTERVAL = 8;
 /// The set of screens behind this terminal (e.g. primary vs alternate).
 screens: ScreenSet,
 
+/// Optional callback for history rows before their contents are erased.
+history_erased_callback: ?*const fn (*PageList, ?*anyopaque, usize, usize) void = null,
+history_erased_userdata: ?*anyopaque = null,
+
 /// Whether we're currently writing to the status line (DECSASD and DECSSDT).
 /// We don't support a status line currently so we just black hole this
 /// data so that it doesn't mess up our main display.
@@ -172,6 +176,17 @@ pub const Colors = struct {
         .palette = .default,
     };
 };
+
+pub fn setHistoryErasedCallback(
+    self: *Terminal,
+    callback: ?*const fn (*PageList, ?*anyopaque, usize, usize) void,
+    userdata: ?*anyopaque,
+) void {
+    self.history_erased_callback = callback;
+    self.history_erased_userdata = userdata;
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| entry.value.*.pages.setHistoryErasedCallback(callback, userdata);
+}
 
 /// Returns the current color for an xterm OSC color target.
 ///
@@ -4175,6 +4190,7 @@ pub fn resize(
             break :alt;
         };
 
+        replacement.pages.setHistoryErasedCallback(self.history_erased_callback, self.history_erased_userdata);
         replacement.charset = charset;
         self.screens.switchTo(.alternate);
     }
@@ -4783,6 +4799,8 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
             },
         );
     };
+
+    new.pages.setHistoryErasedCallback(self.history_erased_callback, self.history_erased_userdata);
 
     // The new screen should not have any hyperlinks set
     assert(new.cursor.hyperlink_id == 0);

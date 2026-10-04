@@ -449,6 +449,10 @@ page_compression: IncrementalCompressionState = .{},
 /// outside of an in-progress reflow.
 recycle_node: ?*List.Node = null,
 
+/// Optional notification invoked synchronously before history rows are erased.
+history_erased: ?*const fn (*PageList, ?*anyopaque, usize, usize) void = null,
+history_erased_userdata: ?*anyopaque = null,
+
 /// Limits for scrollback.
 limits: Limits,
 
@@ -961,6 +965,20 @@ fn releasePoolPage(pool: *MemoryPool, page: *const Page) void {
     pool.pages.release(item);
 }
 
+/// Install or clear the observational callback for history destruction.
+pub fn setHistoryErasedCallback(
+    self: *PageList,
+    callback: ?*const fn (*PageList, ?*anyopaque, usize, usize) void,
+    userdata: ?*anyopaque,
+) void {
+    self.history_erased = callback;
+    self.history_erased_userdata = userdata;
+}
+
+fn notifyHistoryErased(self: *PageList, first: usize, count: usize) void {
+    if (self.history_erased) |callback| callback(self, self.history_erased_userdata, first, count);
+}
+
 /// Deinit the pagelist, freeing all page memory and the memory pool.
 pub fn deinit(self: *PageList) void {
     // Verify integrity before cleanup
@@ -1005,6 +1023,10 @@ pub fn reset(self: *PageList) void {
         self.rows,
         cap.rows,
     ) catch unreachable;
+
+    // History content is still readable until releasePages destroys it.
+    const history_rows = self.total_rows - self.rows;
+    if (history_rows > 0) self.notifyHistoryErased(0, history_rows);
 
     // Before resetting our pools we need to release our pages: heap-owned
     // pages go back to the page allocator and pool-owned pages back to
@@ -4042,6 +4064,10 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         self.pages.first != self.pages.last and
         self.page_size + PagePool.item_size > self.limits.max(.bytes))
     prune: {
+        const first_candidate = self.pages.first.?;
+        if (self.total_rows - first_candidate.rows() + 1 >= self.rows) {
+            self.notifyHistoryErased(0, first_candidate.rows());
+        }
         const first = self.pages.popFirst().?;
         assert(first != last);
 
@@ -5577,9 +5603,13 @@ fn eraseRows(
             }
 
             erased += chunk.node.rows();
+            if (tl_pt == .history) self.notifyHistoryErased(0, chunk.node.rows());
             self.erasePage(chunk.node);
             continue;
         }
+
+        // Notify before the boundary rows are shifted and reset.
+        if (tl_pt == .history and chunk.end > 0) self.notifyHistoryErased(0, chunk.end);
 
         // Moving the retained suffix changes every captured row coordinate.
         self.invalidateNodeLayout(chunk.node);
@@ -7105,6 +7135,9 @@ const Limits = struct {
             for (pagelist.tracked_pins.keys()) |p| {
                 if (p.node == first) p.garbage = true;
             }
+
+            // Notify while the oldest historical page remains readable.
+            pagelist.notifyHistoryErased(0, first_rows);
 
             // erasePage updates the list, pin targets, and byte accounting.
             // Row accounting belongs to the caller because erasePage is also used
@@ -20727,6 +20760,64 @@ test "PageList resize trimmed rows have default state" {
         try testing.expectEqual(.none, rac.row.semantic_prompt);
         try testing.expect(rac.cell.isZero());
     }
+}
+
+test "PageList history erased callbacks cover erase and reset spans" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 24 });
+    defer s.deinit();
+
+    const Capture = struct {
+        count: usize = 0,
+        rows: usize = 0,
+        visible: bool = true,
+
+        fn callback(pl: *PageList, userdata: ?*anyopaque, first_row: usize, count: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.count += 1;
+            self.rows += count;
+            if (first_row != 0 or pl.pages.first == null or pl.pages.first.?.rows() < count) self.visible = false;
+        }
+    };
+    var captured: Capture = .{};
+    s.setHistoryErasedCallback(&Capture.callback, &captured);
+
+    try s.growRows(3 * page_rows);
+    s.setMaxBytes(PagePool.item_size);
+    try testing.expect(captured.count > 0);
+    try testing.expect(captured.rows > 0);
+    try testing.expect(captured.visible);
+
+    captured = .{};
+    const retained_history = s.total_rows - s.rows;
+    s.eraseHistory(null);
+    try testing.expect(captured.count > 0);
+    try testing.expectEqual(retained_history, captured.rows);
+    try testing.expect(captured.visible);
+
+    captured = .{};
+    try s.growRows(2 * page_rows);
+    try testing.expect(captured.count > 0);
+    try testing.expect(captured.rows > 0);
+    try testing.expect(captured.visible);
+
+    captured = .{};
+    const reset_history = s.total_rows - s.rows;
+    s.reset();
+    try testing.expect(captured.count > 0);
+    try testing.expectEqual(reset_history, captured.rows);
+    try testing.expect(captured.visible);
+
+    captured = .{};
+    try s.growRows(2 * page_rows);
+    captured = .{};
+    try s.resize(.{ .cols = 100 });
+    try testing.expectEqual(@as(usize, 0), captured.count);
+    captured = .{};
+    s.eraseActive(0);
+    try testing.expectEqual(@as(usize, 0), captured.count);
 }
 
 test "PageList memory pool never touches idle page memory" {
