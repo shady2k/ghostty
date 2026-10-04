@@ -1,6 +1,6 @@
 # The fork supplies nocx's pinned six-target static VT archives. This workflow
 # exists only on a build branch; the fork's main stays a fast-forward of upstream.
-# The source build is the exact unmodified upstream revision pinned below.
+# The source carries the narrowly scoped history-erased effect.
 name: Build nocx libghostty-vt archives
 
 on:
@@ -16,9 +16,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      UPSTREAM_COMMIT: befcdfd2c3a1cb24d9ec886e93c95b2b5daa7028
+      UPSTREAM_COMMIT: 574f5b2b48b4cd782fb876d104ca5832be133808
+      UPSTREAM_BASE_COMMIT: befcdfd2c3a1cb24d9ec886e93c95b2b5daa7028
     steps:
-      - name: Check out the exact unmodified upstream source
+      - name: Check out the pinned fork source with the history-erased effect
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.UPSTREAM_COMMIT }}
@@ -38,21 +39,22 @@ jobs:
           cache-dependency-path: nocx/go.sum
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      - name: Build from unmodified upstream and record the hashes
+      - name: Build the pinned fork source and record the hashes
         shell: bash
         run: |
           set -euo pipefail
           # The workflow branch may have several build-only commits, but the
-          # checked-out source is always one exact, unpatched upstream commit.
+          # checked-out source is always the exact fork commit named above.
           cd ghostty
           source_commit="$UPSTREAM_COMMIT"
           test "$(git rev-parse HEAD)" = "$source_commit"
           cd ../nocx
           tag="libghostty-vt-${source_commit:0:12}"
           manifest=third_party/libghostty-vt/MANIFEST.json
-          jq --arg commit "$source_commit" --arg tag "$tag" \
+          jq --arg commit "$source_commit" \
+            --arg base "$UPSTREAM_BASE_COMMIT" --arg tag "$tag" \
             '.upstream.repository = "https://github.com/shady2k/ghostty" |
-             .upstream.commit = $commit | .upstream.baseCommit = $commit |
+             .upstream.commit = $commit | .upstream.baseCommit = $base |
              .upstream.patch = "" | .release.tag = $tag |
              .release.assetURLTemplate = ("https://github.com/shady2k/ghostty/releases/download/" + $tag + "/{asset}")' \
             "$manifest" > "$manifest.tmp"
