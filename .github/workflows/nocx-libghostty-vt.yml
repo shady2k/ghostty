@@ -51,11 +51,15 @@ jobs:
           cd ../nocx
           tag="libghostty-vt-${source_commit:0:12}"
           manifest=third_party/libghostty-vt/MANIFEST.json
+          patch="src/terminal/PageList.zig, src/terminal/c/terminal.zig,"
+          patch="$patch include/ghostty/vt/terminal.h: synchronous history-erased effect"
+          patch="$patch (nocx-zg3k3.5.19, branch nocx/history-erased-effect)"
           jq --arg commit "$source_commit" \
             --arg base "$UPSTREAM_BASE_COMMIT" --arg tag "$tag" \
+            --arg patch "$patch" \
             '.upstream.repository = "https://github.com/shady2k/ghostty" |
              .upstream.commit = $commit | .upstream.baseCommit = $base |
-             .upstream.patch = "" | .release.tag = $tag |
+             .upstream.patch = $patch | .release.tag = $tag |
              .release.assetURLTemplate = ("https://github.com/shady2k/ghostty/releases/download/" + $tag + "/{asset}")' \
             "$manifest" > "$manifest.tmp"
           mv "$manifest.tmp" "$manifest"
